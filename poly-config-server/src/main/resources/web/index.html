@@ -3,80 +3,368 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>poly-config</title>
+    <title>poly-config 控制台</title>
+    <link rel="stylesheet" href="/vendor/element-plus/index.css">
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>
-    <h1>poly-config</h1>
-    <span id="cluster">加载中...</span>
-</header>
-
-<main>
-    <section class="card">
-        <h2>配置编辑</h2>
-        <div class="grid">
-            <label>命名空间<input id="namespace" value="public"></label>
-            <label>分组<input id="group" value="DEFAULT_GROUP"></label>
-            <label>Data ID<input id="dataId" value="application.yml"></label>
-            <label>类型
-                <select id="type">
-                    <option>YAML</option>
-                    <option>JSON</option>
-                    <option>PROPERTIES</option>
-                    <option>TEXT</option>
-                    <option>XML</option>
-                    <option>HTML</option>
-                </select>
-            </label>
-            <label>操作人<input id="operator" value="console"></label>
+<div id="app" v-cloak>
+    <header class="app-header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-mark">P</span>
+                <span>poly-config</span>
+            </div>
+            <el-menu :default-active="activeView" mode="horizontal" class="top-menu"
+                     :ellipsis="false" @select="switchView">
+                <el-menu-item index="configs">配置管理</el-menu-item>
+                <el-menu-item index="namespaces">命名空间</el-menu-item>
+                <el-menu-item index="cluster">集群管理</el-menu-item>
+            </el-menu>
         </div>
-        <textarea id="content" rows="12" placeholder="配置内容"></textarea>
-        <div class="actions">
-            <button id="publish">发布</button>
-            <button id="delete" class="danger">删除</button>
-            <button id="loadHistory" class="secondary">历史版本</button>
-            <span id="message"></span>
+        <div class="header-right">
+            <el-tag :type="healthType" effect="light">{{ healthText }}</el-tag>
+            <el-button @click="refreshCurrent">刷新</el-button>
         </div>
-    </section>
+    </header>
 
-    <section class="card">
-        <h2>配置列表</h2>
-        <div class="actions">
-            <button id="refreshList" class="secondary">刷新</button>
+    <main class="app-main">
+        <!-- 配置管理 -->
+        <section v-if="activeView === 'configs'">
+            <div class="page-heading">
+                <h1>配置管理</h1>
+                <p>按命名空间和分组管理配置，修改后实时推送给订阅客户端</p>
+            </div>
+
+            <el-card shadow="never" class="toolbar-card">
+                <div class="toolbar">
+                    <div class="filters">
+                        <el-select v-model="namespace" class="filter namespace-filter"
+                                   @change="onNamespaceChange">
+                            <el-option v-for="item in namespaces" :key="item"
+                                       :label="item" :value="item"></el-option>
+                        </el-select>
+                        <el-select v-model="group" class="filter group-filter"
+                                   filterable allow-create default-first-option
+                                   @change="onGroupChange">
+                            <el-option v-for="item in groups" :key="item"
+                                       :label="item" :value="item"></el-option>
+                        </el-select>
+                        <el-input v-model="search" class="filter search-filter"
+                                  placeholder="Data ID" clearable
+                                  @input="onSearchInput"
+                                  @keyup.enter="loadConfigs"
+                                  @clear="loadConfigs"></el-input>
+                        <el-button type="primary" @click="loadConfigs">查询</el-button>
+                        <el-button @click="resetFilters">重置</el-button>
+                    </div>
+                    <div class="toolbar-actions">
+                        <el-button type="primary" @click="openCreate">新建配置</el-button>
+                    </div>
+                </div>
+            </el-card>
+
+            <el-card shadow="never">
+                <el-table :data="pagedConfigs" v-loading="loading" stripe
+                          row-key="dataId" style="width: 100%">
+                    <el-table-column prop="dataId" label="Data ID" min-width="180">
+                        <template #default="{ row }">
+                            <span class="mono">{{ row.dataId }}</span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="group" label="Group" width="150"></el-table-column>
+                    <el-table-column label="配置内容" width="240">
+                        <template #default="{ row }">
+                            <span class="preview">{{ preview(row.content) }}</span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="type" label="格式" width="110"></el-table-column>
+                    <el-table-column prop="operator" label="操作人" width="120"></el-table-column>
+                    <el-table-column label="更新时间" width="180">
+                        <template #default="{ row }">
+                            {{ formatTime(row.modifiedTime) }}
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="210" fixed="right">
+                        <template #default="{ row }">
+                            <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+                            <el-button link @click="openHistory(row)">历史</el-button>
+                            <el-button link type="danger" @click="deleteConfig(row)">删除</el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+                <div class="table-footer">
+                    <span class="total">共 {{ filteredConfigs.length }} 条</span>
+                    <el-pagination v-model:current-page="configPage"
+                                   v-model:page-size="configPageSize"
+                                   :page-sizes="[10, 20, 50]"
+                                   :total="filteredConfigs.length"
+                                   layout="sizes, prev, pager, next"
+                                   background></el-pagination>
+                </div>
+            </el-card>
+        </section>
+
+        <!-- 命名空间 -->
+        <section v-else-if="activeView === 'namespaces'">
+            <div class="page-heading">
+                <h1>命名空间</h1>
+                <p>命名空间用于隔离环境或租户，选择后进入对应配置</p>
+            </div>
+
+            <el-card shadow="never">
+                <div class="card-title">
+                    <div>
+                        <h2>命名空间列表</h2>
+                        <p>共 {{ namespaces.length }} 个命名空间</p>
+                    </div>
+                    <el-button type="primary" @click="namespaceDialogVisible = true">
+                        新增命名空间
+                    </el-button>
+                </div>
+
+                <el-table :data="pagedNamespaces" stripe row-key="name" style="width: 100%">
+                    <el-table-column label="命名空间" min-width="240">
+                        <template #default="{ row }">
+                            <span class="mono">{{ row.name }}</span>
+                            <el-tag v-if="row.name === namespace" size="small" type="success"
+                                    class="current-tag">当前</el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="180">
+                        <template #default="{ row }">
+                            <el-button link type="primary" @click="enterNamespace(row.name)">
+                                进入配置
+                            </el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+
+                <div class="table-footer">
+                    <span class="total">共 {{ namespaces.length }} 条</span>
+                    <el-pagination v-model:current-page="namespacePage"
+                                   v-model:page-size="namespacePageSize"
+                                   :page-sizes="[10, 20, 50]"
+                                   :total="namespaces.length"
+                                   layout="sizes, prev, pager, next"
+                                   background></el-pagination>
+                </div>
+            </el-card>
+        </section>
+
+        <!-- 集群管理 -->
+        <section v-else>
+            <div class="page-heading">
+                <h1>集群管理</h1>
+                <p>当前节点视角的集群信息</p>
+            </div>
+
+            <el-row :gutter="20">
+                <el-col :xs="24" :sm="24" :md="8">
+                    <el-card shadow="never">
+                        <div class="card-title">
+                            <div>
+                                <h2>集群信息</h2>
+                                <p>当前节点配置</p>
+                            </div>
+                        </div>
+                        <el-descriptions :column="1" border>
+                            <el-descriptions-item label="集群 ID">
+                                {{ cluster.clusterId || '-' }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="运行模式">
+                                {{ cluster.mode || '-' }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="当前节点">
+                                {{ cluster.currentNodeId || '-' }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="节点数量">
+                                {{ (cluster.nodes || []).length }}
+                            </el-descriptions-item>
+                        </el-descriptions>
+                    </el-card>
+                </el-col>
+                <el-col :xs="24" :sm="24" :md="16">
+                    <el-card shadow="never">
+                        <div class="card-title">
+                            <div>
+                                <h2>节点列表</h2>
+                                <p>健康状态与协议角色</p>
+                            </div>
+                            <el-button @click="loadCluster">刷新</el-button>
+                        </div>
+                        <el-table :data="cluster.nodes || []" stripe style="width: 100%">
+                            <el-table-column prop="nodeId" label="节点" min-width="110">
+                                <template #default="{ row }">
+                                    <span class="mono">{{ row.nodeId }}</span>
+                                </template>
+                            </el-table-column>
+                            <el-table-column prop="host" label="IP" min-width="130">
+                                <template #default="{ row }">
+                                    <span class="mono">{{ row.host || '-' }}</span>
+                                </template>
+                            </el-table-column>
+                            <el-table-column prop="port" label="HTTP 端口" width="110"></el-table-column>
+                            <el-table-column prop="remotingPort" label="长连接端口" width="120"></el-table-column>
+                            <el-table-column prop="role" label="角色" width="120"></el-table-column>
+                            <el-table-column prop="term" label="任期" width="80"></el-table-column>
+                            <el-table-column prop="leaderId" label="Leader" min-width="110"></el-table-column>
+                            <el-table-column label="状态" width="90">
+                                <template #default="{ row }">
+                                    <el-tag :type="row.healthy ? 'success' : 'danger'" size="small">
+                                        {{ row.healthy ? '健康' : '异常' }}
+                                    </el-tag>
+                                </template>
+                            </el-table-column>
+                        </el-table>
+                    </el-card>
+                </el-col>
+            </el-row>
+        </section>
+    </main>
+
+    <!-- 配置编辑抽屉 -->
+    <el-drawer v-model="editorVisible" :title="editorTitle" size="640px"
+               :close-on-click-modal="false">
+        <el-form label-position="top" class="editor-form">
+            <el-row :gutter="16">
+                <el-col :span="12">
+                    <el-form-item label="Data ID">
+                        <el-input v-model="editor.dataId" :disabled="editor.editing"
+                                  placeholder="application.yml"></el-input>
+                    </el-form-item>
+                </el-col>
+                <el-col :span="6">
+                    <el-form-item label="格式">
+                        <el-select v-model="editor.type" style="width: 100%">
+                            <el-option label="YAML" value="YAML"></el-option>
+                            <el-option label="JSON" value="JSON"></el-option>
+                            <el-option label="PROPERTIES" value="PROPERTIES"></el-option>
+                        </el-select>
+                    </el-form-item>
+                </el-col>
+                <el-col :span="6">
+                    <el-form-item label="分组">
+                        <el-input v-model="editor.group" disabled></el-input>
+                    </el-form-item>
+                </el-col>
+            </el-row>
+            <el-form-item label="操作人">
+                <el-input v-model="editor.operator"></el-input>
+            </el-form-item>
+            <el-form-item label="配置内容">
+                <el-input v-model="editor.content" type="textarea" :rows="18"
+                          class="code-input"
+                          placeholder="在这里粘贴 YAML / JSON / Properties 内容"></el-input>
+            </el-form-item>
+            <div v-if="validation.checked" class="validation-panel">
+                <el-alert v-if="validation.errors.length" type="error" :closable="false" show-icon
+                          :title="'格式校验失败（' + validation.errors.length + ' 个错误）'">
+                    <ul class="validation-list">
+                        <li v-for="(item, index) in validation.errors" :key="'error-' + index">
+                            {{ item }}
+                        </li>
+                    </ul>
+                </el-alert>
+                <el-alert v-else-if="validation.warnings.length" type="warning" :closable="false"
+                          show-icon :title="'格式校验有警告（' + validation.warnings.length + ' 条）'">
+                    <ul class="validation-list">
+                        <li v-for="(item, index) in validation.warnings" :key="'warning-' + index">
+                            {{ item }}
+                        </li>
+                    </ul>
+                </el-alert>
+                <el-alert v-else type="success" :closable="false" show-icon
+                          title="格式校验通过"></el-alert>
+            </div>
+        </el-form>
+        <template #footer>
+            <div class="drawer-footer">
+                <el-button type="primary" @click="openDiff">发布</el-button>
+                <el-button v-if="editor.editing" type="danger" @click="deleteEditorConfig">
+                    删除
+                </el-button>
+                <el-button v-if="editor.editing" @click="showHistoryFromEditor">历史版本</el-button>
+                <el-button @click="editorVisible = false">取消</el-button>
+            </div>
+        </template>
+    </el-drawer>
+
+    <!-- 历史版本抽屉 -->
+    <el-drawer v-model="historyVisible" :title="'历史版本 · ' + historyDataId" size="640px">
+        <el-table :data="history" stripe style="width: 100%">
+            <el-table-column prop="revision" label="Revision" width="100"></el-table-column>
+            <el-table-column label="操作" width="110">
+                <template #default="{ row }">
+                    <el-tag :type="operationType(row.operation)" size="small">
+                        {{ row.operation }}
+                    </el-tag>
+                </template>
+            </el-table-column>
+            <el-table-column prop="operator" label="操作人" width="120"></el-table-column>
+            <el-table-column label="时间">
+                <template #default="{ row }">{{ formatTime(row.timestamp) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="150">
+                <template #default="{ row }">
+                    <el-button link type="primary" @click="loadVersion(row)">载入</el-button>
+                    <el-button link type="warning" @click="rollback(row)">回滚</el-button>
+                </template>
+            </el-table-column>
+        </el-table>
+    </el-drawer>
+
+    <!-- 发布前 diff 确认 -->
+    <el-dialog v-model="diffVisible" title="发布前确认" width="min(960px, 94vw)" class="diff-dialog">
+        <div class="diff-meta">
+            <span><strong>Data ID</strong> <span class="mono">{{ diffDataId }}</span></span>
+            <span><strong>分组</strong> <span class="mono">{{ diffGroup }}</span></span>
+            <span><strong>格式</strong> {{ diffType }}</span>
+            <span class="diff-summary">
+                <span class="diff-add-count">+{{ diffAdds }}</span>
+                <span class="diff-remove-count">-{{ diffRemoves }}</span>
+            </span>
         </div>
-        <table>
-            <thead>
-            <tr>
-                <th>Data ID</th>
-                <th>版本</th>
-                <th>MD5</th>
-                <th>更新时间</th>
-                <th>操作人</th>
-                <th></th>
-            </tr>
-            </thead>
-            <tbody id="configTable"></tbody>
-        </table>
-    </section>
 
-    <section class="card">
-        <h2>历史版本</h2>
-        <table>
-            <thead>
-            <tr>
-                <th>Revision</th>
-                <th>操作</th>
-                <th>操作人</th>
-                <th>时间</th>
-                <th></th>
-            </tr>
-            </thead>
-            <tbody id="historyTable"></tbody>
-        </table>
-    </section>
-</main>
+        <el-alert v-if="diffTruncated" type="warning" :closable="false" show-icon
+                  title="内容较长，仅展示前 1500 行，确认发布时仍会写入完整内容"
+                  class="diff-alert"></el-alert>
 
+        <div v-if="diffRows.length" class="diff-body">
+            <div v-for="(row, index) in diffRows" :key="index"
+                 class="diff-row" :class="row.type">
+                <span class="diff-ln">{{ row.oldNo == null ? '' : row.oldNo }}</span>
+                <span class="diff-ln">{{ row.newNo == null ? '' : row.newNo }}</span>
+                <span class="diff-sign">{{ row.type === 'add' ? '+' : (row.type === 'remove' ? '-' : ' ') }}</span>
+                <span class="diff-text">{{ row.text }}</span>
+            </div>
+        </div>
+        <div v-else class="diff-empty">内容为空</div>
+
+        <template #footer>
+            <el-button @click="diffVisible = false">取消</el-button>
+            <el-button type="primary" @click="confirmPublish">确认发布</el-button>
+        </template>
+    </el-dialog>
+
+    <!-- 新增命名空间 -->
+    <el-dialog v-model="namespaceDialogVisible" title="新增命名空间" width="420px">
+        <el-form label-position="top">
+            <el-form-item label="命名空间名称">
+                <el-input v-model="newNamespaceName" placeholder="例如 dev / stage"
+                          @keyup.enter="createNamespace"></el-input>
+            </el-form-item>
+        </el-form>
+        <template #footer>
+            <el-button @click="namespaceDialogVisible = false">取消</el-button>
+            <el-button type="primary" @click="createNamespace">创建</el-button>
+        </template>
+    </el-dialog>
+</div>
+
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/vendor/element-plus/index.full.min.js"></script>
+<script src="/vendor/js-yaml.min.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

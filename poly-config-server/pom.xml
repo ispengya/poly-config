@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.ispengya.polyconfig</groupId>
+        <artifactId>poly-config</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>poly-config-server</artifactId>
+    <name>poly-config-server</name>
+    <description>启动装配、HTTP API、Netty 接入与控制台资源</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.ispengya.polyconfig</groupId>
+            <artifactId>poly-config-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ispengya.polyconfig</groupId>
+            <artifactId>poly-config-raft</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ispengya.polyconfig</groupId>
+            <artifactId>poly-config-distro</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+</project>

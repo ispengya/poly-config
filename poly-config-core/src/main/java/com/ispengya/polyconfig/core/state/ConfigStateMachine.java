@@ -4,6 +4,7 @@ import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.model.ConfigChangeEvent;
 import com.ispengya.polyconfig.common.model.ConfigCommand;
+import com.ispengya.polyconfig.common.model.ConfigConstants;
 import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.ConfigKey;
 import com.ispengya.polyconfig.common.model.ConfigType;
@@ -20,6 +21,8 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -145,10 +148,8 @@ public class ConfigStateMachine implements StateMachine {
 
     @Override
     public List<ConfigEntry> list(String namespace, String group) {
-        String targetNamespace = normalize(namespace,
-                com.ispengya.polyconfig.common.model.ConfigConstants.DEFAULT_NAMESPACE);
-        String targetGroup = normalize(group,
-                com.ispengya.polyconfig.common.model.ConfigConstants.DEFAULT_GROUP);
+        String targetNamespace = normalize(namespace, ConfigConstants.DEFAULT_NAMESPACE);
+        String targetGroup = normalize(group, ConfigConstants.DEFAULT_GROUP);
         List<ConfigEntry> result = new ArrayList<>();
         for (ConfigEntry entry : current.values()) {
             if (entry.getKey().getNamespace().equals(targetNamespace)
@@ -176,6 +177,29 @@ public class ConfigStateMachine implements StateMachine {
             }
         }
         return result;
+    }
+
+    @Override
+    public List<String> namespaces() {
+        Set<String> result = new TreeSet<>();
+        result.add(ConfigConstants.DEFAULT_NAMESPACE);
+        for (ConfigKey key : current.keySet()) {
+            result.add(key.getNamespace());
+        }
+        return new ArrayList<>(result);
+    }
+
+    @Override
+    public List<String> groups(String namespace) {
+        String targetNamespace = normalize(namespace, ConfigConstants.DEFAULT_NAMESPACE);
+        Set<String> result = new TreeSet<>();
+        result.add(ConfigConstants.DEFAULT_GROUP);
+        for (ConfigKey key : current.keySet()) {
+            if (key.getNamespace().equals(targetNamespace)) {
+                result.add(key.getGroup());
+            }
+        }
+        return new ArrayList<>(result);
     }
 
     @Override

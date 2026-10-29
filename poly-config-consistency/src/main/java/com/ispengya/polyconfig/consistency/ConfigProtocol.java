@@ -57,6 +57,36 @@ public interface ConfigProtocol extends AutoCloseable {
     List<HistoryEntry> history(ConfigKey key, int limit);
 
     /**
+     * 返回当前存在配置的命名空间。
+     *
+     * @return 命名空间列表
+     */
+    List<String> namespaces();
+
+    /**
+     * 返回指定命名空间下存在配置的分组。
+     *
+     * @param namespace 命名空间
+     * @return 分组列表
+     */
+    List<String> groups(String namespace);
+
+    /**
+     * 创建命名空间。
+     *
+     * @param namespace 命名空间名称
+     */
+    void createNamespace(String namespace);
+
+    /**
+     * 在命名空间下创建分组。
+     *
+     * @param namespace 命名空间
+     * @param group 分组名称
+     */
+    void createGroup(String namespace, String group);
+
+    /**
      * 返回节点状态。
      *
      * @return 节点状态

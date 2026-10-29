@@ -7,6 +7,7 @@ import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import org.junit.Test;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -43,6 +44,21 @@ public class ConfigStateMachineTest {
         assertEquals(3, events.get());
 
         assertEquals(1, stateMachine.list("public", "DEFAULT_GROUP").size());
+    }
+
+    @Test
+    public void shouldListNamespacesAndGroups() {
+        ConfigStateMachine stateMachine = new ConfigStateMachine(10);
+
+        assertEquals(Arrays.asList("public"), stateMachine.namespaces());
+        assertEquals(Arrays.asList("DEFAULT_GROUP"), stateMachine.groups("public"));
+
+        ConfigKey devKey = new ConfigKey("dev", "ORDER", "app.yml");
+        stateMachine.apply(ConfigCommand.publish(devKey, "v1", ConfigType.YAML, "alice"), 1L);
+
+        assertEquals(Arrays.asList("dev", "public"), stateMachine.namespaces());
+        assertEquals(Arrays.asList("DEFAULT_GROUP", "ORDER"), stateMachine.groups("dev"));
+        assertEquals(Arrays.asList("DEFAULT_GROUP"), stateMachine.groups("prod"));
     }
 
     @Test

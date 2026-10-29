@@ -50,6 +50,21 @@ public interface StateMachine {
     List<HistoryEntry> history(ConfigKey key, int limit);
 
     /**
+     * 返回当前存在配置的命名空间，至少包含默认命名空间。
+     *
+     * @return 命名空间列表
+     */
+    List<String> namespaces();
+
+    /**
+     * 返回指定命名空间下存在配置的分组，至少包含默认分组。
+     *
+     * @param namespace 命名空间
+     * @return 分组列表
+     */
+    List<String> groups(String namespace);
+
+    /**
      * 注册变更监听器。
      *
      * @param listener 监听器

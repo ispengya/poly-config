@@ -53,7 +53,7 @@ public class ConfigService {
                                   String content, String type, String operator) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
         ConfigCommand command = ConfigCommand.publish(key, content == null ? "" : content,
-                ConfigType.from(type), normalizeOperator(operator));
+                ConfigType.fromSupported(type), normalizeOperator(operator));
         return protocol.propose(command);
     }
 
@@ -110,6 +110,44 @@ public class ConfigService {
     public List<HistoryEntry> history(String namespace, String group, String dataId, int limit) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
         return protocol.history(key, limit);
+    }
+
+    /**
+     * 返回当前存在配置的命名空间。
+     *
+     * @return 命名空间列表
+     */
+    public List<String> namespaces() {
+        return protocol.namespaces();
+    }
+
+    /**
+     * 返回指定命名空间下存在配置的分组。
+     *
+     * @param namespace 命名空间
+     * @return 分组列表
+     */
+    public List<String> groups(String namespace) {
+        return protocol.groups(namespace);
+    }
+
+    /**
+     * 创建命名空间。
+     *
+     * @param namespace 命名空间名称
+     */
+    public void createNamespace(String namespace) {
+        protocol.createNamespace(namespace);
+    }
+
+    /**
+     * 在命名空间下创建分组。
+     *
+     * @param namespace 命名空间
+     * @param group 分组名称
+     */
+    public void createGroup(String namespace, String group) {
+        protocol.createGroup(namespace, group);
     }
 
     /**

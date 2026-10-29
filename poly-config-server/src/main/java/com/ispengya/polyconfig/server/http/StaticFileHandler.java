@@ -39,6 +39,22 @@ public class StaticFileHandler implements HttpHandler {
                     resource = "/web/style.css";
                     contentType = "text/css; charset=UTF-8";
                     break;
+                case "/vendor/vue.global.prod.js":
+                    resource = "/web/vendor/vue.global.prod.js";
+                    contentType = "application/javascript; charset=UTF-8";
+                    break;
+                case "/vendor/element-plus/index.full.min.js":
+                    resource = "/web/vendor/element-plus/index.full.min.js";
+                    contentType = "application/javascript; charset=UTF-8";
+                    break;
+                case "/vendor/element-plus/index.css":
+                    resource = "/web/vendor/element-plus/index.css";
+                    contentType = "text/css; charset=UTF-8";
+                    break;
+                case "/vendor/js-yaml.min.js":
+                    resource = "/web/vendor/js-yaml.min.js";
+                    contentType = "application/javascript; charset=UTF-8";
+                    break;
                 default:
                     sendEmpty(exchange, 404);
                     return;
@@ -63,7 +79,8 @@ public class StaticFileHandler implements HttpHandler {
             }
 
             exchange.getResponseHeaders().set("Content-Type", contentType);
-            exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+            exchange.getResponseHeaders().set("Cache-Control",
+                    path.startsWith("/vendor/") ? "public, max-age=31536000" : "no-cache");
             exchange.sendResponseHeaders(200, bytes.length);
             try (OutputStream output = exchange.getResponseBody()) {
                 output.write(bytes);

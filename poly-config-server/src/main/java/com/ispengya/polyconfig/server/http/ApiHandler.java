@@ -6,6 +6,8 @@ import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import com.ispengya.polyconfig.common.protocol.ApiResponse;
 import com.ispengya.polyconfig.common.protocol.ConfigView;
+import com.ispengya.polyconfig.common.protocol.CreateGroupRequest;
+import com.ispengya.polyconfig.common.protocol.CreateNamespaceRequest;
 import com.ispengya.polyconfig.common.protocol.HistoryView;
 import com.ispengya.polyconfig.common.protocol.PublishRequest;
 import com.ispengya.polyconfig.common.protocol.RollbackRequest;
@@ -64,6 +66,23 @@ public class ApiHandler implements HttpHandler {
                 writeJson(exchange, 200, ApiResponse.ok(configService.clusterStatus()));
                 return;
             }
+            if ("GET".equalsIgnoreCase(method) && "/v1/cs/namespaces".equals(path)) {
+                writeJson(exchange, 200, ApiResponse.ok(configService.namespaces()));
+                return;
+            }
+            if ("POST".equalsIgnoreCase(method) && "/v1/cs/namespaces".equals(path)) {
+                handleCreateNamespace(exchange);
+                return;
+            }
+            if ("GET".equalsIgnoreCase(method) && "/v1/cs/groups".equals(path)) {
+                writeJson(exchange, 200,
+                        ApiResponse.ok(configService.groups(query(exchange).get("namespace"))));
+                return;
+            }
+            if ("POST".equalsIgnoreCase(method) && "/v1/cs/groups".equals(path)) {
+                handleCreateGroup(exchange);
+                return;
+            }
             if ("GET".equalsIgnoreCase(method) && "/v1/cs/configs/list".equals(path)) {
                 handleListConfigs(exchange);
                 return;
@@ -101,6 +120,26 @@ public class ApiHandler implements HttpHandler {
         } finally {
             exchange.close();
         }
+    }
+
+    private void handleCreateNamespace(HttpExchange exchange) throws IOException {
+        CreateNamespaceRequest request = JsonUtils.parseObject(readBody(exchange),
+                CreateNamespaceRequest.class);
+        if (request == null) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "创建命名空间请求体为空");
+        }
+        configService.createNamespace(request.getNamespace());
+        writeJson(exchange, 200, ApiResponse.ok(request.getNamespace()));
+    }
+
+    private void handleCreateGroup(HttpExchange exchange) throws IOException {
+        CreateGroupRequest request = JsonUtils.parseObject(readBody(exchange),
+                CreateGroupRequest.class);
+        if (request == null) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "创建分组请求体为空");
+        }
+        configService.createGroup(request.getNamespace(), request.getGroup());
+        writeJson(exchange, 200, ApiResponse.ok(request.getGroup()));
     }
 
     private void handleGetConfig(HttpExchange exchange) throws IOException {

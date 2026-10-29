@@ -46,8 +46,12 @@ public class CoreChainIntegrationTest {
 
             Response cluster = get(server.getHttpPort(), "/v1/cs/cluster");
             assertEquals(200, cluster.status);
-            assertEquals("STANDALONE",
-                    JSON.parseObject(cluster.body).getJSONObject("data").getString("mode"));
+            JSONObject clusterData = JSON.parseObject(cluster.body).getJSONObject("data");
+            assertEquals("STANDALONE", clusterData.getString("mode"));
+            JSONObject clusterNode = clusterData.getJSONArray("nodes").getJSONObject(0);
+            assertEquals("127.0.0.1", clusterNode.getString("host"));
+            assertTrue(clusterNode.getIntValue("port") > 0);
+            assertTrue(clusterNode.getIntValue("remotingPort") > 0);
 
             client = new PolyConfigClient(clientOptions(server, snapshotDir));
             final CountDownLatch latch = new CountDownLatch(1);
@@ -113,6 +117,30 @@ public class CoreChainIntegrationTest {
             JSONArray items = JSON.parseObject(list.body).getJSONArray("data");
             assertEquals(1, items.size());
             assertEquals("v2", items.getJSONObject(0).getString("content"));
+
+            Response namespaces = get(server.getHttpPort(), "/v1/cs/namespaces");
+            assertTrue(JSON.parseObject(namespaces.body).getJSONArray("data").contains("public"));
+
+            Response groups = get(server.getHttpPort(),
+                    "/v1/cs/groups?namespace=public");
+            assertTrue(JSON.parseObject(groups.body).getJSONArray("data")
+                    .contains("DEFAULT_GROUP"));
+
+            JSONObject createNamespace = new JSONObject();
+            createNamespace.put("namespace", "stage");
+            assertEquals(200, post(server.getHttpPort(), "/v1/cs/namespaces",
+                    createNamespace.toJSONString()).status);
+            assertTrue(JSON.parseObject(get(server.getHttpPort(), "/v1/cs/namespaces").body)
+                    .getJSONArray("data").contains("stage"));
+
+            JSONObject createGroup = new JSONObject();
+            createGroup.put("namespace", "public");
+            createGroup.put("group", "PAYMENT");
+            assertEquals(200, post(server.getHttpPort(), "/v1/cs/groups",
+                    createGroup.toJSONString()).status);
+            assertTrue(JSON.parseObject(get(server.getHttpPort(),
+                    "/v1/cs/groups?namespace=public").body)
+                    .getJSONArray("data").contains("PAYMENT"));
 
             Response history = get(server.getHttpPort(),
                     "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&limit=10");

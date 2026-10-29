@@ -18,15 +18,19 @@ import com.ispengya.polyconfig.consistency.NodeStatus;
 import com.ispengya.polyconfig.consistency.ProtocolMode;
 import com.ispengya.polyconfig.consistency.ReadConsistency;
 import com.ispengya.polyconfig.core.state.ConfigStateMachine;
+import com.ispengya.polyconfig.core.workspace.WorkspaceRegistry;
 import com.ispengya.polyconfig.storage.log.SegmentLog;
 import com.ispengya.polyconfig.storage.log.SegmentLogConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * 单机协议实现。
@@ -48,6 +52,11 @@ public class LocalProtocol implements ConfigProtocol {
     private final ConfigStateMachine stateMachine;
 
     /**
+     * 命名空间与分组元数据。
+     */
+    private final WorkspaceRegistry workspaceRegistry;
+
+    /**
      * 节点 ID。
      */
     private final String nodeId;
@@ -56,6 +65,21 @@ public class LocalProtocol implements ConfigProtocol {
      * 集群 ID。
      */
     private final String clusterId;
+
+    /**
+     * 节点对外主机名或 IP。
+     */
+    private volatile String host = "";
+
+    /**
+     * HTTP 端口。
+     */
+    private volatile int httpPort;
+
+    /**
+     * 客户端长连接端口。
+     */
+    private volatile int remotingPort;
 
     /**
      * 已应用的命令序号。
@@ -79,6 +103,7 @@ public class LocalProtocol implements ConfigProtocol {
         this.nodeId = nodeId;
         this.clusterId = clusterId;
         this.stateMachine = new ConfigStateMachine(historyLimit);
+        this.workspaceRegistry = new WorkspaceRegistry(dataDir.resolve("workspaces.json"));
         this.segmentLog = new SegmentLog(SegmentLogConfig.builder(dataDir.resolve("log"))
                 .syncOnAppend(false)
                 .build());
@@ -92,6 +117,19 @@ public class LocalProtocol implements ConfigProtocol {
             log.warn("配置日志在启动时发生截断, truncatedOffset={}",
                     segmentLog.getRecoveryTruncatedOffset());
         }
+    }
+
+    /**
+     * 更新节点对外地址。
+     *
+     * @param host 主机名或 IP
+     * @param httpPort HTTP 端口
+     * @param remotingPort 客户端长连接端口
+     */
+    public void setNodeAddress(String host, int httpPort, int remotingPort) {
+        this.host = host == null ? "" : host;
+        this.httpPort = httpPort;
+        this.remotingPort = remotingPort;
     }
 
     @Override
@@ -131,9 +169,37 @@ public class LocalProtocol implements ConfigProtocol {
     }
 
     @Override
+    public List<String> namespaces() {
+        ensureOpen();
+        Set<String> result = new TreeSet<>(workspaceRegistry.namespaces());
+        result.addAll(stateMachine.namespaces());
+        return new ArrayList<>(result);
+    }
+
+    @Override
+    public List<String> groups(String namespace) {
+        ensureOpen();
+        Set<String> result = new TreeSet<>(workspaceRegistry.groups(namespace));
+        result.addAll(stateMachine.groups(namespace));
+        return new ArrayList<>(result);
+    }
+
+    @Override
+    public void createNamespace(String namespace) {
+        ensureOpen();
+        workspaceRegistry.createNamespace(namespace);
+    }
+
+    @Override
+    public void createGroup(String namespace, String group) {
+        ensureOpen();
+        workspaceRegistry.createGroup(namespace, group);
+    }
+
+    @Override
     public NodeStatus status() {
-        return new NodeStatus(nodeId, ProtocolMode.STANDALONE, NodeRole.STANDALONE,
-                !closed, 0L, "", 1);
+        return new NodeStatus(nodeId, host, httpPort, remotingPort,
+                ProtocolMode.STANDALONE, NodeRole.STANDALONE, !closed, 0L, "", 1);
     }
 
     @Override

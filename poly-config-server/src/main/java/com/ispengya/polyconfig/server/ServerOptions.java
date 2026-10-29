@@ -17,6 +17,11 @@ public final class ServerOptions {
     private final String host;
 
     /**
+     * 对外展示的主机名或 IP，为空时自动探测。
+     */
+    private final String advertiseHost;
+
+    /**
      * HTTP 端口，0 表示随机端口。
      */
     private final int httpPort;
@@ -53,6 +58,7 @@ public final class ServerOptions {
 
     private ServerOptions(Builder builder) {
         this.host = builder.host;
+        this.advertiseHost = builder.advertiseHost;
         this.httpPort = builder.httpPort;
         this.remotingPort = builder.remotingPort;
         this.dataDir = builder.dataDir;
@@ -74,8 +80,8 @@ public final class ServerOptions {
     /**
      * 从命令行参数解析配置。
      *
-     * <p>支持 --host、--http-port、--remoting-port、--data-dir、--node-id、
-     * --cluster-id、--history-limit、--mode 八项。</p>
+     * <p>支持 --host、--advertise-host、--http-port、--remoting-port、--data-dir、
+     * --node-id、--cluster-id、--history-limit、--mode 九项。</p>
      *
      * @param args 命令行参数
      * @return 启动配置
@@ -99,6 +105,9 @@ public final class ServerOptions {
             switch (key) {
                 case "host":
                     builder.host(value);
+                    break;
+                case "advertise-host":
+                    builder.advertiseHost(value);
                     break;
                 case "http-port":
                     builder.httpPort(Integer.parseInt(value));
@@ -131,6 +140,10 @@ public final class ServerOptions {
 
     public String getHost() {
         return host;
+    }
+
+    public String getAdvertiseHost() {
+        return advertiseHost;
     }
 
     public int getHttpPort() {
@@ -172,6 +185,11 @@ public final class ServerOptions {
         private String host = "0.0.0.0";
 
         /**
+         * 对外展示的主机名或 IP，为空时自动探测。
+         */
+        private String advertiseHost;
+
+        /**
          * HTTP 端口。
          */
         private int httpPort = 8848;
@@ -208,6 +226,11 @@ public final class ServerOptions {
 
         public Builder host(String host) {
             this.host = host;
+            return this;
+        }
+
+        public Builder advertiseHost(String advertiseHost) {
+            this.advertiseHost = advertiseHost;
             return this;
         }
 

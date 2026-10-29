@@ -3,6 +3,7 @@ package com.ispengya.polyconfig.server;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
+import com.ispengya.polyconfig.common.util.NetworkUtils;
 import com.ispengya.polyconfig.core.service.ConfigService;
 import com.ispengya.polyconfig.server.http.ApiHandler;
 import com.ispengya.polyconfig.server.http.StaticFileHandler;
@@ -141,9 +142,12 @@ public class PolyConfigServer {
         remotingServer.start();
         httpServer.start();
         configService.start();
+        String advertisedHost = resolveAdvertisedHost();
+        protocol.setNodeAddress(advertisedHost, getHttpPort(), getRemotingPort());
         started = true;
-        log.info("poly-config started, http={}:{}, remoting={}, dataDir={}",
-                options.getHost(), getHttpPort(), getRemotingPort(), options.getDataDir());
+        log.info("poly-config started, http={}:{}, remoting={}, advertised={}, dataDir={}",
+                options.getHost(), getHttpPort(), getRemotingPort(), advertisedHost,
+                options.getDataDir());
     }
 
     /**
@@ -180,6 +184,14 @@ public class PolyConfigServer {
      */
     public int getRemotingPort() {
         return remotingServer.localListenPort();
+    }
+
+    private String resolveAdvertisedHost() {
+        String configured = options.getAdvertiseHost();
+        if (configured != null && !configured.trim().isEmpty()) {
+            return configured.trim();
+        }
+        return NetworkUtils.resolveAdvertisedHost(options.getHost());
     }
 
     private static ThreadFactory daemonFactory(String prefix) {

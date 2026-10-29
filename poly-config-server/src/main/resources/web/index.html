@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>poly-config</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+    <h1>poly-config</h1>
+    <span id="cluster">加载中...</span>
+</header>
+
+<main>
+    <section class="card">
+        <h2>配置编辑</h2>
+        <div class="grid">
+            <label>命名空间<input id="namespace" value="public"></label>
+            <label>分组<input id="group" value="DEFAULT_GROUP"></label>
+            <label>Data ID<input id="dataId" value="application.yml"></label>
+            <label>类型
+                <select id="type">
+                    <option>YAML</option>
+                    <option>JSON</option>
+                    <option>PROPERTIES</option>
+                    <option>TEXT</option>
+                    <option>XML</option>
+                    <option>HTML</option>
+                </select>
+            </label>
+            <label>操作人<input id="operator" value="console"></label>
+        </div>
+        <textarea id="content" rows="12" placeholder="配置内容"></textarea>
+        <div class="actions">
+            <button id="publish">发布</button>
+            <button id="delete" class="danger">删除</button>
+            <button id="loadHistory" class="secondary">历史版本</button>
+            <span id="message"></span>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>配置列表</h2>
+        <div class="actions">
+            <button id="refreshList" class="secondary">刷新</button>
+        </div>
+        <table>
+            <thead>
+            <tr>
+                <th>Data ID</th>
+                <th>版本</th>
+                <th>MD5</th>
+                <th>更新时间</th>
+                <th>操作人</th>
+                <th></th>
+            </tr>
+            </thead>
+            <tbody id="configTable"></tbody>
+        </table>
+    </section>
+
+    <section class="card">
+        <h2>历史版本</h2>
+        <table>
+            <thead>
+            <tr>
+                <th>Revision</th>
+                <th>操作</th>
+                <th>操作人</th>
+                <th>时间</th>
+                <th></th>
+            </tr>
+            </thead>
+            <tbody id="historyTable"></tbody>
+        </table>
+    </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,6 +1,7 @@
 package com.ispengya.polyconfig.common.util;
 
 import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.TypeReference;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 
@@ -35,6 +36,22 @@ public final class JsonUtils {
      * @return 解析结果
      */
     public static <T> T parseObject(String json, Class<T> type) {
+        try {
+            return JSON.parseObject(json, type);
+        } catch (RuntimeException e) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "JSON 解析失败", e);
+        }
+    }
+
+    /**
+     * 将 JSON 字符串解析为泛型对象。
+     *
+     * @param json JSON 字符串
+     * @param type 目标类型引用
+     * @param <T> 目标类型
+     * @return 解析结果
+     */
+    public static <T> T parseObject(String json, TypeReference<T> type) {
         try {
             return JSON.parseObject(json, type);
         } catch (RuntimeException e) {

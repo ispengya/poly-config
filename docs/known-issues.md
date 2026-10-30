@@ -87,7 +87,7 @@
 
 ### ISSUE-06 无快照与日志前缀压缩
 
-- 位置：`poly-config-server` 的 `LocalProtocol` 构造；`poly-config-storage`
+- 位置：`poly-config-core` 的 `LocalProtocol` 构造；`poly-config-storage`
 - 现状：启动时 `SegmentLog.scan` 全量回放；存储层没有快照，也没有删除前缀段的能力。
 - 风险：日志持续增长，重启时间线性增加；历史数据无法按快照压缩。
 - 建议：增加 `SnapshotStore`（原子快照 + 版本号）和日志前缀压缩/epoch 目录；启动时加载最新快照再回放增量。

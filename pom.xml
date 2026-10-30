@@ -14,13 +14,8 @@
 
     <modules>
         <module>poly-config-common</module>
-        <module>poly-config-storage</module>
-        <module>poly-config-consistency</module>
-        <module>poly-config-raft</module>
-        <module>poly-config-distro</module>
-        <module>poly-config-core</module>
-        <module>poly-config-server</module>
         <module>poly-config-client</module>
+        <module>poly-config-server</module>
     </modules>
 
     <properties>

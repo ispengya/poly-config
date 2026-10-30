@@ -93,17 +93,22 @@ CP 与 AP 都不依赖 `mini-file-storage` 的 `FileStore` 门面。Raft 需要�
 
 ## 8. 模块骨架（提案）
 
+模块数 = 交付物数：一个服务端 jar、一个 SDK jar，共享代码单独一模块。
+
 ```
 poly-config
-├── poly-config-common          数据模型、异常、常量
-├── poly-config-storage         统一分段日志、状态机存储、快照
-├── poly-config-consistency     一致性 SPI（StateMachine、Proposal、读语义）
-├── poly-config-raft            CP 实现 + RaftLog
-├── poly-config-distro          AP 实现 + 本地 mutation log
-├── poly-config-core            配置服务、通知引擎、订阅注册表
-├── poly-config-server          启动、HTTP API、集群装配、控制台资源
-└── poly-config-client          SDK：缓存、监听、本地快照、故障转移
+├── poly-config-common          数据模型、异常、常量、协议 DTO（共享层）
+├── poly-config-client          SDK：缓存、监听、本地快照、故障转移
+└── poly-config-server          服务端
+    ├── storage/                统一分段日志、状态机存储、快照
+    ├── consistency/            一致性 SPI（ConfigProtocol、StateMachine、读语义）
+    ├── core/                   配置服务、通知引擎、订阅注册表、单机协议（standalone/LocalProtocol）
+    └── server/                 启动装配、HTTP API、Netty 接入、控制台资源
 ```
+
+服务端内部按包分区，不再拆模块；包名代表职责分区，artifact 代表交付单元。
+M1 / M2 的 Raft 与 Distro 实现分别落在 `server` 的 `raft`、`distro` 包下，
+不进独立 artifact，避免空模块让读者误以为 CP / AP 已有实现。
 
 ## 9. 待定项
 
@@ -129,6 +134,8 @@ poly-config
 | 2026-10-29 | 控制台由 server 提供静态资源，不单独起进程 |
 | 2026-10-29 | 集群成员采用静态配置，动态成员列为后续里程碑 |
 | 2026-10-29 | 控制台通过单节点的集群感知 API 管理整个集群，不直连各节点 |
+| 2026-10-30 | 模块收敛为 6 个：删除空的 raft / distro，`LocalProtocol` 从 server 移入 core |
+| 2026-10-30 | 模块再收敛为 3 个：storage / consistency / core 并入 server，包名不变，common 独立 |
 
 ## 11. 实施顺序（当前阶段）
 

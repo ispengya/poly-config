@@ -13,22 +13,12 @@
 
     <artifactId>poly-config-server</artifactId>
     <name>poly-config-server</name>
-    <description>启动装配、HTTP API、Netty 接入与控制台资源</description>
+    <description>服务端：存储、一致性 SPI、配置服务、HTTP API、Netty 接入与控制台资源</description>
 
     <dependencies>
         <dependency>
             <groupId>com.ispengya.polyconfig</groupId>
-            <artifactId>poly-config-core</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.ispengya.polyconfig</groupId>
-            <artifactId>poly-config-raft</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.ispengya.polyconfig</groupId>
-            <artifactId>poly-config-distro</artifactId>
+            <artifactId>poly-config-common</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>

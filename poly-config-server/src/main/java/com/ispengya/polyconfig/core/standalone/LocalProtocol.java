@@ -1,4 +1,4 @@
-package com.ispengya.polyconfig.server.standalone;
+package com.ispengya.polyconfig.core.standalone;
 
 import com.ispengya.polyconfig.common.codec.CommandCodec;
 import com.ispengya.polyconfig.common.error.ErrorCode;

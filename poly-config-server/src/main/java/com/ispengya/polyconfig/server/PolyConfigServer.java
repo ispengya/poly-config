@@ -11,7 +11,7 @@ import com.ispengya.polyconfig.server.push.ChangePusher;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
-import com.ispengya.polyconfig.server.standalone.LocalProtocol;
+import com.ispengya.polyconfig.core.standalone.LocalProtocol;
 import com.ispengya.remoting.netty.NettyRemotingServer;
 import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;

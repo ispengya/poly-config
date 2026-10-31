@@ -24,10 +24,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -66,6 +68,22 @@ public class PolyConfigClient implements ConfigService {
      * 配置 MD5 缓存。
      */
     private final ConcurrentHashMap<ConfigKey, String> md5Cache = new ConcurrentHashMap<>();
+
+    /**
+     * 每个配置键最后应用的 revision，用于丢弃乱序到达的旧视图（ISSUE-02）。
+     */
+    private final ConcurrentHashMap<ConfigKey, Long> revisionCache = new ConcurrentHashMap<>();
+
+    /**
+     * 每个配置键的应用锁，序列化缓存更新与通知提交。
+     */
+    private final ConcurrentHashMap<ConfigKey, Object> keyLocks = new ConcurrentHashMap<>();
+
+    /**
+     * 每个配置键的串行回调队列，保证同一 key 的回调按提交顺序执行（ISSUE-03）。
+     */
+    private final ConcurrentHashMap<ConfigKey, SerialExecutor> callbackQueues =
+            new ConcurrentHashMap<>();
 
     /**
      * 监听器表。
@@ -284,18 +302,12 @@ public class PolyConfigClient implements ConfigService {
     private void processPush(ConfigKey key, PushEvent event) {
         try {
             if ("DELETE".equals(event.getOperation())) {
-                contentCache.remove(key);
-                md5Cache.remove(key);
-                deleteSnapshot(key);
-                notifyListeners(key, null);
+                applyDeletion(key, event.getRevision());
                 return;
             }
             ConfigView view = fetch(key, options.getRequestTimeoutMillis());
             if (view == null) {
-                contentCache.remove(key);
-                md5Cache.remove(key);
-                deleteSnapshot(key);
-                notifyListeners(key, null);
+                applyDeletion(key, event.getRevision());
                 return;
             }
             applyView(view, true);
@@ -306,28 +318,85 @@ public class PolyConfigClient implements ConfigService {
         }
     }
 
-    private void applyView(ConfigView view, boolean notify) {
+    /**
+     * 应用配置视图。
+     *
+     * <p>revision 小于已应用版本的旧视图直接丢弃（ISSUE-02）；同一 key 的缓存更新与
+     * 通知提交在键锁内完成，保证通知提交顺序与 revision 一致（ISSUE-03）。</p>
+     *
+     * @param view 配置视图
+     * @param notify 内容变化时是否通知监听器
+     * @return 是否实际应用
+     */
+    boolean applyView(ConfigView view, boolean notify) {
         if (view == null) {
-            return;
+            return false;
         }
         ConfigKey key = new ConfigKey(view.getNamespace(), view.getGroup(), view.getDataId());
         String content = view.getContent() == null ? "" : view.getContent();
-        String previous = contentCache.put(key, content);
-        md5Cache.put(key, view.getMd5());
-        writeSnapshot(key, content);
-        if (notify && (previous == null || !previous.equals(content))) {
-            notifyListeners(key, content);
+        long revision = view.getRevision();
+        synchronized (lockFor(key)) {
+            long last = revisionCache.getOrDefault(key, -1L);
+            if (revision < last) {
+                log.debug("丢弃过期配置视图, key={}, revision={}, lastRevision={}",
+                        key, revision, last);
+                return false;
+            }
+            revisionCache.put(key, revision);
+            String previous = contentCache.put(key, content);
+            md5Cache.put(key, view.getMd5());
+            writeSnapshot(key, content);
+            if (notify && (previous == null || !previous.equals(content))) {
+                enqueueNotify(key, content);
+            }
         }
+        return true;
     }
 
-    private void notifyListeners(ConfigKey key, String content) {
+    /**
+     * 应用删除（推送删除或拉取不到内容）。
+     *
+     * <p>携带 revision 时按单调守卫丢弃过期删除；revision 未知（小于等于 0）时
+     * 按旧行为直接删除。</p>
+     *
+     * @param key 配置键
+     * @param revision 删除事件的 revision，未知时传 0
+     */
+    void applyDeletion(ConfigKey key, long revision) {
+        synchronized (lockFor(key)) {
+            long last = revisionCache.getOrDefault(key, -1L);
+            if (revision > 0 && revision < last) {
+                log.debug("丢弃过期删除, key={}, revision={}, lastRevision={}",
+                        key, revision, last);
+                return;
+            }
+            if (revision > 0) {
+                revisionCache.put(key, revision);
+            }
+            contentCache.remove(key);
+            md5Cache.remove(key);
+            enqueueNotify(key, null);
+        }
+        deleteSnapshot(key);
+    }
+
+    private Object lockFor(ConfigKey key) {
+        return keyLocks.computeIfAbsent(key, value -> new Object());
+    }
+
+    private void enqueueNotify(ConfigKey key, String content) {
         CopyOnWriteArrayList<ConfigListener> list = listeners.get(key);
         if (list == null || list.isEmpty()) {
             return;
         }
+        SerialExecutor queue = callbackQueues.computeIfAbsent(key,
+                value -> new SerialExecutor(callbackExecutor));
         for (ConfigListener listener : list) {
             try {
-                callbackExecutor.execute(() -> {
+                queue.execute(() -> {
+                    if (closed.get()) {
+                        return;
+                    }
                     try {
                         listener.onChange(key.getDataId(), key.getGroup(), content);
                     } catch (RuntimeException e) {
@@ -336,6 +405,43 @@ public class PolyConfigClient implements ConfigService {
                 });
             } catch (RejectedExecutionException e) {
                 return;
+            }
+        }
+    }
+
+    /**
+     * 串行执行器：把任务按提交顺序转交共享线程池逐个执行。
+     *
+     * <p>保证同一配置键的回调不并发、执行顺序与提交顺序一致；不同 key 之间仍然并行。</p>
+     */
+    private static final class SerialExecutor implements Executor {
+
+        private final Executor delegate;
+        private final ArrayDeque<Runnable> queue = new ArrayDeque<>();
+        private Runnable active;
+
+        SerialExecutor(Executor delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public synchronized void execute(Runnable command) {
+            queue.add(() -> {
+                try {
+                    command.run();
+                } finally {
+                    scheduleNext();
+                }
+            });
+            if (active == null) {
+                scheduleNext();
+            }
+        }
+
+        private synchronized void scheduleNext() {
+            active = queue.poll();
+            if (active != null) {
+                delegate.execute(active);
             }
         }
     }

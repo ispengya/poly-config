@@ -2,7 +2,7 @@
 
 > 范围：M0 单机核心链路
 > 更新：2026-10-31（逐项对照代码核实）
-> 状态：已核实——ISSUE-01、04、15 已修复；其余未修复；修复顺序见下节
+> 状态：已核实——ISSUE-01、02、03、04、05、15 已修复；其余未修复；修复顺序见下节
 
 ## 优先级
 
@@ -17,10 +17,10 @@
 | ID | 优先级 | 类别 | 问题 | 影响 |
 |---|---|---|---|---|
 | ISSUE-01 | P0 | 存储 | SegmentLog 缺少数据目录文件锁（已修复，2026-10-31） | 同一目录双开会写坏日志 |
-| ISSUE-02 | P0 | 客户端 | 推送/对账响应乱序时配置可能回退 | 旧内容覆盖新内容 |
-| ISSUE-03 | P0 | 客户端 | 同一配置的监听回调可能乱序 | 监听器看到旧值晚于新值 |
+| ISSUE-02 | P0 | 客户端 | 推送/对账响应乱序时配置可能回退（已修复，2026-10-31） | 旧内容覆盖新内容 |
+| ISSUE-03 | P0 | 客户端 | 同一配置的监听回调可能乱序（已修复，2026-10-31） | 监听器看到旧值晚于新值 |
 | ISSUE-04 | P0 | 存储 | 恢复截断静默删除后续段（已修复，2026-10-31） | 数据丢失不可审计 |
-| ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权（remoting 端口无视 --host） | 局域网内可读写 |
+| ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权（已修复：默认回环，2026-10-31） | 局域网内可读写 |
 | ISSUE-06 | P1 | 存储 | 无快照与日志前缀压缩 | 日志无限增长、重启变慢 |
 | ISSUE-07 | P1 | 性能 | 每条命令 fsync，无 group commit | 写吞吐受磁盘延迟限制 |
 | ISSUE-08 | P1 | 推送 | 无 UNSUBSCRIBE，移除监听后仍推送 | 无效推送与资源浪费 |
@@ -46,12 +46,12 @@
 ## 修复顺序（2026-10-31 核实后，围绕单机核心链路）
 
 > 单机核心链路 = 写入（客户端 → HTTP/remoting → propose → SegmentLog）+ 订阅/推送 + 重启恢复。
-> 核实结论：ISSUE-01、ISSUE-04、ISSUE-15 已修复且有测试覆盖；其余 23 项未修复（其中 ISSUE-11、25
-> 有部分进展，已并入对应条目）。ISSUE-05 经核实 remoting 端口无视 `--host`，修复范围扩大。
+> 核实结论：ISSUE-01、02、03、04、05、15 已修复且有测试覆盖；其余 20 项未修复（其中 ISSUE-11、25
+> 有部分进展，已并入对应条目）。
 
 | 梯队 | 顺序 | 条目 | 理由 |
 |---|---|---|---|
-| T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（已修） | 配置回退、默认暴露（需连带修 remoting 绑定）、回调乱序；ISSUE-15 已于 2026-10-31 修复 |
+| T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（全部已修，2026-10-31） | T1 清零 |
 | T2 性能/可靠性 | 5→8 | ISSUE-07 → 06 → 17 → 18 | group commit 提吞吐；快照的隔离前置（ISSUE-04）已就位；锁分离为快照扫描铺路 |
 | T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13 | ISSUE-13 体量小，可顺手提前 |
 | T4 外围 | — | 其余（12/14/16/19-26） | 非核心链路，暂缓 |
@@ -70,21 +70,28 @@
   `close()` 时释放；恢复阶段抛异常时也释放锁。测试见
   `SegmentLogTest.shouldRejectSecondOpenOnSameDir`。
 
-### ISSUE-02 推送/对账响应乱序时配置可能回退
+### ISSUE-02 推送/对账响应乱序时配置可能回退（已修复，2026-10-31）
 
 - 位置：`poly-config-client` 的 `PolyConfigClient.applyView`
 - 现状：每次拉取成功都无条件覆盖 `contentCache` 和 `md5Cache`，没有比较版本。
 - 风险：同一 key 连续两次变更，两个拉取并发执行，较旧 revision 的响应后到，会把新内容覆盖回旧内容。
 - 建议：为每个 key 记录已应用的 revision，只允许 `view.revision >= lastRevision` 覆盖；推送和对账共用同一规则。
 - 验证：构造两个延迟不同的拉取响应，确认旧 revision 不会覆盖新 revision。
+- 修复：新增 `revisionCache` 记录每 key 最后应用的 revision；`applyView` 在键锁内做单调守卫，
+  旧 revision 视图直接丢弃（不覆盖缓存、不写快照、不通知）。删除路径 `applyDeletion` 按推送事件
+  的 revision 守卫，防止过期删除抹掉新内容；revision 未知时保持旧行为。测试见
+  `PolyConfigClientTest.shouldDropStaleView`、`shouldDropStaleDeletion`。
 
-### ISSUE-03 同一配置的监听回调可能乱序
+### ISSUE-03 同一配置的监听回调可能乱序（已修复，2026-10-31）
 
 - 位置：`PolyConfigClient.notifyListeners`
 - 现状：回调统一提交到 4 线程的 `callbackExecutor`，同一 key 的多次回调可能并发执行。
 - 风险：监听器先收到新值、后收到旧值，业务侧基于回调做本地更新时出现回退。
 - 建议：按 key 串行回调，或给回调带上 revision 让调用方过滤；更简单的是每 key 一个串行队列。
 - 验证：同一 key 快速触发两次变更，断言回调顺序与 revision 一致。
+- 修复：每 key 一个 `SerialExecutor`（共享线程池上的串行队列），通知在键锁内按 revision 顺序
+  提交，同一 key 回调不并发、顺序与提交一致，不同 key 之间仍然并行。测试见
+  `PolyConfigClientTest.shouldNotifySameKeyInOrder`。
 
 ### ISSUE-04 恢复截断静默删除后续段（已修复，2026-10-31）
 
@@ -100,7 +107,7 @@
   `SegmentLogTest.shouldQuarantineSubsequentSegmentsOnGap`。
   注意：`truncateTo` 是调用方主动截断的 API，其删除行为保持不变。
 
-### ISSUE-05 默认监听 0.0.0.0 且无鉴权（核实：remoting 无视 --host，范围比原描述大）
+### ISSUE-05 默认监听 0.0.0.0 且无鉴权（已修复：默认回环，2026-10-31；鉴权仍由 ISSUE-19 跟进）
 
 - 位置：`ServerOptions` 默认 `host=0.0.0.0`，HTTP/remoting 均无鉴权
 - 现状：开发默认配置会把管理面和长连接暴露到所有网卡，任何能访问端口的客户端都可以发布、删除、订阅。
@@ -111,6 +118,11 @@
 - 建议：默认绑定 `127.0.0.1`，**并同时把 host 传入 NettyRemotingServer（remoting-core 构造器需增加
   bind 地址参数）**；集群模式再显式配置 `0.0.0.0` 并配合防火墙。只改 `ServerOptions` 默认值只能堵住 HTTP。
 - 验证：默认启动后 HTTP 与 remoting **都**只监听回环；显式传 `--host=0.0.0.0` 时两者都对外。
+- 修复：默认 `host` 改为 `127.0.0.1`；`PolyConfigServer` 把 host 传入 `NettyRemotingServer`
+  （remoting-core 升级 0.2.1，新增 `(host, port)` 构造器，host 为空时保持绑定所有网卡）。
+  HTTP 与 remoting 端口默认都只监听回环，显式 `--host=0.0.0.0` 才对外。测试见
+  `ServerOptionsTest` 与 remoting-core 的 `RemotingTest.loopbackBoundServerRejectsLanAccess`。
+  鉴权、TLS、限流仍由 ISSUE-19 跟进。
 
 ### ISSUE-06 无快照与日志前缀压缩
 

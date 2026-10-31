@@ -41,8 +41,10 @@ const app = createApp({
     data() {
         return {
             activeView: 'configs',
+            configNavOpen: true,
             namespace: 'public',
             group: 'DEFAULT_GROUP',
+            expandedNs: '',
             namespaces: [],
             groups: [],
             namespaceFilter: '',
@@ -195,9 +197,9 @@ const app = createApp({
             try {
                 await this.loadCluster();
                 await this.loadNamespaces();
+                this.expandedNs = this.namespace;
                 await this.loadGroups();
-                this.revealActive('.rail-groups');
-                this.revealActive('.rail-ns');
+                this.revealActive('.rail-tree');
                 await this.loadConfigs();
             } catch (e) {
                 this.$message.error(e.message);
@@ -221,6 +223,12 @@ const app = createApp({
                 : ['DEFAULT_GROUP'];
         },
         async loadConfigs() {
+            if (!this.group) {
+                // 还没选分组：主区显示引导空态
+                this.configs = [];
+                this.configPage = 1;
+                return;
+            }
             this.loading = true;
             try {
                 const params = new URLSearchParams({
@@ -253,6 +261,9 @@ const app = createApp({
         /* ---------- 导航 ---------- */
 
         async switchView(view) {
+            if (view === 'configs') {
+                this.configNavOpen = true; // 回到配置视图时自动展开配置树
+            }
             if (this.activeView === view) {
                 return;
             }
@@ -284,35 +295,41 @@ const app = createApp({
                 this.refreshing = false;
             }
         },
-        async selectNamespace(name) {
-            this.namespaceFilter = '';
-            this.groupFilter = '';
-            if (name === this.namespace) {
+        /* 手风琴：点命名空间展开/收起它的分组；切换命名空间时不自动选分组 */
+        async toggleNamespace(name) {
+            if (name === this.expandedNs) {
+                // 收起
+                this.expandedNs = '';
                 return;
             }
+            this.expandedNs = name;
+            if (name === this.namespace) {
+                return; // 分组已加载，只是重新展开
+            }
             this.namespace = name;
+            this.group = ''; // 未选分组，主区显示引导
+            this.groupFilter = '';
             this.search = '';
             this.configPage = 1;
+            this.configs = [];
             try {
                 await this.loadGroups();
-                if (this.groups.indexOf(this.group) < 0) {
-                    this.group = this.groups[0] || 'DEFAULT_GROUP';
-                }
-                this.revealActive('.rail-groups');
-                await this.loadConfigs();
             } catch (e) {
                 this.$message.error(e.message);
             }
         },
         async selectGroup(name) {
             this.groupFilter = '';
-            if (name === this.group) {
+            if (name === this.group && this.activeView === 'configs') {
                 return;
             }
             this.group = name;
             this.search = '';
             this.configPage = 1;
-            this.revealActive('.rail-groups');
+            if (this.activeView !== 'configs') {
+                this.activeView = 'configs';
+            }
+            this.revealActive('.rail-tree');
             try {
                 await this.loadConfigs();
             } catch (e) {
@@ -329,7 +346,7 @@ const app = createApp({
         },
         pickFirstNamespace() {
             if (this.filteredNamespaces.length) {
-                this.selectNamespace(this.filteredNamespaces[0]);
+                this.toggleNamespace(this.filteredNamespaces[0]);
             }
         },
         pickFirstGroup() {
@@ -338,15 +355,15 @@ const app = createApp({
             }
         },
         async onNamespaceChange() {
+            // 移动端下拉切换：同步手风琴展开状态，不自动选分组
+            this.expandedNs = this.namespace;
+            this.group = '';
+            this.groupFilter = '';
             this.search = '';
             this.configPage = 1;
+            this.configs = [];
             try {
                 await this.loadGroups();
-                if (this.groups.indexOf(this.group) < 0) {
-                    this.group = this.groups[0] || 'DEFAULT_GROUP';
-                }
-                this.revealActive('.rail-groups');
-                await this.loadConfigs();
             } catch (e) {
                 this.$message.error(e.message);
             }
@@ -762,6 +779,7 @@ const app = createApp({
                 this.namespaceDialogVisible = false;
                 this.newNamespaceName = '';
                 this.namespace = name;
+                this.expandedNs = name;
                 this.search = '';
                 this.configPage = 1;
                 await this.loadNamespaces();

@@ -114,8 +114,9 @@ public class LocalProtocol implements ConfigProtocol {
             return true;
         });
         if (segmentLog.getRecoveryTruncatedOffset() >= 0) {
-            log.warn("配置日志在启动时发生截断, truncatedOffset={}",
-                    segmentLog.getRecoveryTruncatedOffset());
+            log.warn("配置日志在启动时发生截断, truncatedOffset={}, quarantinedFiles={}",
+                    segmentLog.getRecoveryTruncatedOffset(),
+                    segmentLog.getQuarantinedFiles());
         }
     }
 

@@ -16,11 +16,11 @@
 
 | ID | 优先级 | 类别 | 问题 | 影响 |
 |---|---|---|---|---|
-| ISSUE-01 | P0 | 存储 | SegmentLog 缺少数据目录文件锁 | 同一目录双开会写坏日志 |
+| ISSUE-01 | P0 | 存储 | SegmentLog 缺少数据目录文件锁（已修复，2026-10-31） | 同一目录双开会写坏日志 |
 | ISSUE-02 | P0 | 客户端 | 推送/对账响应乱序时配置可能回退 | 旧内容覆盖新内容 |
 | ISSUE-03 | P0 | 客户端 | 同一配置的监听回调可能乱序 | 监听器看到旧值晚于新值 |
-| ISSUE-04 | P0 | 存储 | 恢复截断静默删除后续段 | 数据丢失不可审计 |
-| ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权 | 局域网内可读写 |
+| ISSUE-04 | P0 | 存储 | 恢复截断静默删除后续段（已修复，2026-10-31） | 数据丢失不可审计 |
+| ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权（延后到集群化：届时只在指定 IP 开启） | 局域网内可读写 |
 | ISSUE-06 | P1 | 存储 | 无快照与日志前缀压缩 | 日志无限增长、重启变慢 |
 | ISSUE-07 | P1 | 性能 | 每条命令 fsync，无 group commit | 写吞吐受磁盘延迟限制 |
 | ISSUE-08 | P1 | 推送 | 无 UNSUBSCRIBE，移除监听后仍推送 | 无效推送与资源浪费 |
@@ -45,13 +45,17 @@
 
 ## 详细说明
 
-### ISSUE-01 SegmentLog 缺少数据目录文件锁
+### ISSUE-01 SegmentLog 缺少数据目录文件锁（已修复，2026-10-31）
 
-- 位置：`poly-config-storage` 的 `SegmentLog`
+- 位置：`storage/log/SegmentLog`
 - 现状：打开日志时只创建目录和文件通道，没有进程级互斥。
 - 风险：同一数据目录启动两个 server 会同时追加和截断日志，造成数据损坏。
 - 建议：在数据目录抢 `.store.lock` 的 `FileLock`，失败直接拒绝启动；关闭时释放。
 - 验证：同一目录连续打开两个 `SegmentLog`，第二个必须抛异常；第一个关闭后第二个可以打开。
+- 修复：构造时对 `<baseDir>/.store.lock` 抢独占 `FileLock`（含同进程重复打开的
+  `OverlappingFileLockException` 处理），抢不到抛 `STORAGE_ERROR` 拒绝启动；
+  `close()` 时释放；恢复阶段抛异常时也释放锁。测试见
+  `SegmentLogTest.shouldRejectSecondOpenOnSameDir`。
 
 ### ISSUE-02 推送/对账响应乱序时配置可能回退
 
@@ -69,13 +73,19 @@
 - 建议：按 key 串行回调，或给回调带上 revision 让调用方过滤；更简单的是每 key 一个串行队列。
 - 验证：同一 key 快速触发两次变更，断言回调顺序与 revision 一致。
 
-### ISSUE-04 恢复截断静默删除后续段
+### ISSUE-04 恢复截断静默删除后续段（已修复，2026-10-31）
 
 - 位置：`SegmentLog.recover`、`deleteFrom`、`deleteQuietly`
 - 现状：发现损坏或文件缺口后直接删除后续段，删除失败也被吞掉；只暴露一个 `recoveryTruncatedOffset`。
 - 风险：数据丢失缺少审计线索，排障时无法知道丢了哪些段、为什么丢。
 - 建议：删除前把段文件加入 `.quarantined` 清单；记录截断 offset、删除文件数和原因；在集群状态或日志中暴露。
 - 验证：制造中间段损坏，重启后检查隔离清单、状态字段和日志。
+- 修复：恢复阶段不再删除段文件，改为移动到 `<baseDir>/.quarantined/<原名>.<时间戳>`
+  并记录 WARN 日志（含原因）；移动失败时保留原文件、下次启动重试。
+  新增 `getQuarantinedFiles()` 暴露隔离清单，`LocalProtocol` 启动日志一并输出。
+  隔离文件名不满足段文件命名规则，不会被再次扫入。测试见
+  `SegmentLogTest.shouldQuarantineSubsequentSegmentsOnGap`。
+  注意：`truncateTo` 是调用方主动截断的 API，其删除行为保持不变。
 
 ### ISSUE-05 默认监听 0.0.0.0 且无鉴权
 

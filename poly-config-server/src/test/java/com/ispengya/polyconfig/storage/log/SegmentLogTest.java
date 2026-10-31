@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -217,6 +218,98 @@ public class SegmentLogTest {
             });
             assertEquals(1, count.get());
         }
+    }
+
+    @Test
+    public void shouldRejectSecondOpenOnSameDir() throws Exception {
+        Path dir = folder.newFolder("locked").toPath();
+        SegmentLogConfig config = config(dir, 1024, 128);
+
+        SegmentLog first = new SegmentLog(config);
+        try {
+            new SegmentLog(config);
+            fail("expected PolyConfigException");
+        } catch (PolyConfigException e) {
+            assertEquals(ErrorCode.STORAGE_ERROR, e.getErrorCode());
+        } finally {
+            first.close();
+        }
+
+        try (SegmentLog reopened = new SegmentLog(config)) {
+            reopened.append(bytes("after-reopen"));
+            assertEquals(1, countRecords(reopened));
+        }
+    }
+
+    @Test
+    public void shouldQuarantineSubsequentSegmentsOnGap() throws Exception {
+        Path dir = folder.newFolder("gap-quarantine").toPath();
+        SegmentLogConfig config = config(dir, 64, 32);
+        byte[] payload = new byte[20];
+
+        List<String> before;
+        try (SegmentLog log = new SegmentLog(config)) {
+            for (int i = 0; i < 4; i++) {
+                payload[0] = (byte) i;
+                log.append(payload);
+            }
+            before = segmentNames(dir);
+            assertTrue("expected multiple segments", before.size() >= 3);
+        }
+
+        // 删掉第二个段文件，制造"文件缺口"
+        Files.delete(dir.resolve(before.get(1)));
+
+        try (SegmentLog log = new SegmentLog(config)) {
+            // 缺口在第二个段：被删除的段本身不计，其后的段全部隔离
+            assertEquals(before.size() - 2, log.getQuarantinedFiles().size());
+            assertEquals(before.get(2), log.getQuarantinedFiles().get(0));
+            // 第一个段仍然可用，缺口之后的段被隔离而非静默删除
+            assertEquals(SegmentLog.FRAME_HEADER_SIZE + 20, log.getMaxOffset());
+            assertEquals(SegmentLog.FRAME_HEADER_SIZE + 20, log.getRecoveryTruncatedOffset());
+        }
+
+        // 被隔离的段文件在 quarantine 目录中保留（原名 + 时间戳后缀）
+        Path quarantineDir = dir.resolve(".quarantined");
+        assertTrue(Files.isDirectory(quarantineDir));
+        List<String> quarantinedNames = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(quarantineDir)) {
+            for (Path file : stream) {
+                quarantinedNames.add(file.getFileName().toString());
+            }
+        }
+        assertEquals(before.size() - 2, quarantinedNames.size());
+        for (String quarantined : quarantinedNames) {
+            boolean matched = false;
+            for (String original : before) {
+                if (quarantined.startsWith(original + ".")) {
+                    matched = true;
+                    break;
+                }
+            }
+            assertTrue("quarantined file should derive from an original segment: " + quarantined,
+                    matched);
+        }
+    }
+
+    private static List<String> segmentNames(Path dir) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.log")) {
+            for (Path file : stream) {
+                names.add(file.getFileName().toString());
+            }
+        }
+        names.sort(Comparator.naturalOrder());
+        return names;
+    }
+
+    private static int countRecords(SegmentLog log) {
+        final AtomicInteger count = new AtomicInteger();
+        log.scan((offset, payload) -> {
+            count.incrementAndGet();
+            return true;
+        });
+        return count.get();
     }
 
     private static SegmentLogConfig config(Path dir, int segmentSize, int maxRecordSize) {

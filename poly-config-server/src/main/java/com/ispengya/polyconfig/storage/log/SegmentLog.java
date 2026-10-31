@@ -3,17 +3,22 @@ package com.ispengya.polyconfig.storage.log;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.util.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -29,9 +34,25 @@ import java.util.zip.CRC32;
  *
  * <p>日志以物理 offset 寻址，段文件名为 20 位补零的起始 offset。启动时按
  * "从 0 开始、连续前缀"的规则恢复：遇到损坏或缺口时截断到最后一个合法帧，
- * 并删除后续段文件。尾部撕裂写入会被直接截断，不会静默保留。</p>
+ * 后续段文件移入 {@code .quarantined} 目录隔离保留，不会静默删除。
+ * 尾部撕裂写入会被直接截断，不会静默保留。</p>
+ *
+ * <p>打开日志时会在数据目录抢 {@code .store.lock} 文件锁；同一数据目录
+ * 已被其他实例（含同进程重复打开）持有时直接拒绝启动，避免双开写坏日志。</p>
  */
 public final class SegmentLog implements Closeable {
+
+    private static final Logger log = LoggerFactory.getLogger(SegmentLog.class);
+
+    /**
+     * 数据目录文件锁名。
+     */
+    private static final String LOCK_FILE_NAME = ".store.lock";
+
+    /**
+     * 恢复截断时隔离段文件的子目录名。
+     */
+    private static final String QUARANTINE_DIR_NAME = ".quarantined";
 
     /**
      * 帧头长度。
@@ -84,6 +105,21 @@ public final class SegmentLog implements Closeable {
     private long recoveryTruncatedOffset = -1L;
 
     /**
+     * 本次启动被隔离到 quarantine 目录的日志段文件名。
+     */
+    private final List<String> quarantinedFiles = new ArrayList<>();
+
+    /**
+     * 数据目录锁文件通道。
+     */
+    private FileChannel lockChannel;
+
+    /**
+     * 数据目录文件锁。
+     */
+    private FileLock lock;
+
+    /**
      * 是否已关闭。
      */
     private boolean closed;
@@ -100,7 +136,13 @@ public final class SegmentLog implements Closeable {
                     "maxRecordSize 过大，单帧无法放入日志段");
         }
         createBaseDir();
-        recover();
+        acquireLock();
+        try {
+            recover();
+        } catch (RuntimeException e) {
+            releaseLockQuietly();
+            throw e;
+        }
     }
 
     /**
@@ -281,6 +323,15 @@ public final class SegmentLog implements Closeable {
         return recoveryTruncatedOffset;
     }
 
+    /**
+     * 返回本次启动被隔离到 quarantine 目录的日志段文件名（不含路径）。
+     *
+     * @return 隔离文件名列表，未发生隔离时为空列表
+     */
+    public synchronized List<String> getQuarantinedFiles() {
+        return Collections.unmodifiableList(quarantinedFiles);
+    }
+
     @Override
     public synchronized void close() {
         if (closed) {
@@ -308,6 +359,7 @@ public final class SegmentLog implements Closeable {
         }
         segments.clear();
         current = null;
+        releaseLockQuietly();
         if (failure != null) {
             throw failure;
         }
@@ -319,6 +371,47 @@ public final class SegmentLog implements Closeable {
         } catch (IOException e) {
             throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
                     "创建日志目录失败: " + config.getBaseDir(), e);
+        }
+    }
+
+    private void acquireLock() {
+        Path lockFile = config.getBaseDir().resolve(LOCK_FILE_NAME);
+        try {
+            lockChannel = FileChannel.open(lockFile,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            try {
+                lock = lockChannel.tryLock();
+            } catch (OverlappingFileLockException e) {
+                lock = null;
+            }
+        } catch (IOException e) {
+            releaseLockQuietly();
+            throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                    "打开数据目录锁文件失败: " + lockFile, e);
+        }
+        if (lock == null) {
+            releaseLockQuietly();
+            throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                    "数据目录已被其他实例占用，拒绝启动: " + config.getBaseDir());
+        }
+    }
+
+    private void releaseLockQuietly() {
+        if (lock != null) {
+            try {
+                lock.release();
+            } catch (IOException ignored) {
+                // 锁释放失败不影响主流程，进程退出后 OS 会回收
+            }
+            lock = null;
+        }
+        if (lockChannel != null) {
+            try {
+                lockChannel.close();
+            } catch (IOException ignored) {
+                // 同上
+            }
+            lockChannel = null;
         }
     }
 
@@ -338,7 +431,8 @@ public final class SegmentLog implements Closeable {
             }
             if (start != expectedStart) {
                 markRecoveryTruncated(expectedStart);
-                deleteFrom(files, i);
+                quarantineFrom(files, i,
+                        "段起始 offset 不连续，期望 " + expectedStart + "，实际 " + start);
                 break;
             }
 
@@ -368,9 +462,9 @@ public final class SegmentLog implements Closeable {
 
             if (validLength == 0 && i > 0) {
                 closeQuietly(segment);
-                deleteQuietly(file);
+                quarantine(file, "空日志段");
                 markRecoveryTruncated(start);
-                deleteFrom(files, i + 1);
+                quarantineFrom(files, i + 1, "空日志段之后的日志段");
                 break;
             }
 
@@ -380,7 +474,8 @@ public final class SegmentLog implements Closeable {
                 long nextStart = parseStart(files.get(i + 1));
                 if (nextStart != end) {
                     markRecoveryTruncated(end);
-                    deleteFrom(files, i + 1);
+                    quarantineFrom(files, i + 1,
+                            "段起始 offset 不连续，期望 " + end + "，实际 " + nextStart);
                     break;
                 }
             }
@@ -573,9 +668,25 @@ public final class SegmentLog implements Closeable {
         return String.format(Locale.ROOT, "%020d%s", startOffset, SEGMENT_SUFFIX);
     }
 
-    private void deleteFrom(List<Path> files, int fromIndex) {
+    private void quarantineFrom(List<Path> files, int fromIndex, String reason) {
         for (int i = fromIndex; i < files.size(); i++) {
-            deleteQuietly(files.get(i));
+            quarantine(files.get(i), reason);
+        }
+    }
+
+    private void quarantine(Path file, String reason) {
+        Path quarantineDir = config.getBaseDir().resolve(QUARANTINE_DIR_NAME);
+        Path target = quarantineDir.resolve(
+                file.getFileName() + "." + System.currentTimeMillis());
+        try {
+            Files.createDirectories(quarantineDir);
+            Files.move(file, target);
+            quarantinedFiles.add(file.getFileName().toString());
+            log.warn("恢复截断隔离日志段: {}，原因: {}，已移至: {}",
+                    file.getFileName(), reason, target);
+        } catch (IOException e) {
+            // 移动失败时保留原文件，避免数据丢失；下次启动重试隔离
+            log.error("隔离日志段失败，文件保留原位: {}，原因: {}", file, reason, e);
         }
     }
 

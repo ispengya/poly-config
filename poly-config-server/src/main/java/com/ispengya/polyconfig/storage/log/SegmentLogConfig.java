@@ -40,11 +40,17 @@ public final class SegmentLogConfig {
      */
     private final boolean syncOnAppend;
 
+    /**
+     * 是否允许首个日志段起始 offset 非 0（存在快照、前缀段已删除时为 true）。
+     */
+    private final boolean allowNonZeroStart;
+
     private SegmentLogConfig(Builder builder) {
         this.baseDir = builder.baseDir;
         this.segmentSize = builder.segmentSize;
         this.maxRecordSize = builder.maxRecordSize;
         this.syncOnAppend = builder.syncOnAppend;
+        this.allowNonZeroStart = builder.allowNonZeroStart;
     }
 
     /**
@@ -73,6 +79,10 @@ public final class SegmentLogConfig {
         return syncOnAppend;
     }
 
+    public boolean isAllowNonZeroStart() {
+        return allowNonZeroStart;
+    }
+
     /**
      * 分段日志配置构造器。
      */
@@ -97,6 +107,11 @@ public final class SegmentLogConfig {
          * 是否每次追加后立即刷盘。
          */
         private boolean syncOnAppend;
+
+        /**
+         * 是否允许首个日志段起始 offset 非 0。
+         */
+        private boolean allowNonZeroStart;
 
         private Builder(Path baseDir) {
             if (baseDir == null) {
@@ -123,6 +138,11 @@ public final class SegmentLogConfig {
 
         public Builder syncOnAppend(boolean syncOnAppend) {
             this.syncOnAppend = syncOnAppend;
+            return this;
+        }
+
+        public Builder allowNonZeroStart(boolean allowNonZeroStart) {
+            this.allowNonZeroStart = allowNonZeroStart;
             return this;
         }
 

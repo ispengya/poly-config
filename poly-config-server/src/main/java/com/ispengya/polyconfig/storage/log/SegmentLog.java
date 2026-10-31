@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.zip.CRC32;
 
 /**
@@ -95,9 +96,15 @@ public final class SegmentLog implements Closeable {
     private Segment current;
 
     /**
+     * 读写锁：追加/刷盘/截断持写锁；扫描只在捕获段清单时短暂持读锁，
+     * 实际读取与 visitor 回调在锁外执行，长扫描不再阻塞写入（ISSUE-17）。
+     */
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    /**
      * 日志合法末尾的物理 offset。
      */
-    private long maxOffset;
+    private volatile long maxOffset;
 
     /**
      * 本次启动发生恢复截断的物理 offset；-1 表示未发生截断。
@@ -122,7 +129,7 @@ public final class SegmentLog implements Closeable {
     /**
      * 是否已关闭。
      */
-    private boolean closed;
+    private volatile boolean closed;
 
     /**
      * 打开或创建分段日志。
@@ -151,29 +158,34 @@ public final class SegmentLog implements Closeable {
      * @param payload 记录内容，null 视为空记录
      * @return 记录起始物理 offset
      */
-    public synchronized long append(byte[] payload) {
-        ensureOpen();
-        byte[] value = payload == null ? new byte[0] : payload;
-        if (value.length > config.getMaxRecordSize()) {
-            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                    "单条记录长度超过上限: " + value.length);
-        }
-        byte[] frame = encodeFrame(value);
-        if (current == null || current.writePosition + frame.length > config.getSegmentSize()) {
-            current = createSegment(maxOffset);
-            segments.put(current.startOffset, current);
-        }
-        long offset = maxOffset;
+    public long append(byte[] payload) {
+        rwLock.writeLock().lock();
         try {
-            current.append(frame);
-        } catch (IOException e) {
-            throw new PolyConfigException(ErrorCode.STORAGE_ERROR, "追加日志失败", e);
+            ensureOpen();
+            byte[] value = payload == null ? new byte[0] : payload;
+            if (value.length > config.getMaxRecordSize()) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "单条记录长度超过上限: " + value.length);
+            }
+            byte[] frame = encodeFrame(value);
+            if (current == null || current.writePosition + frame.length > config.getSegmentSize()) {
+                current = createSegment(maxOffset);
+                segments.put(current.startOffset, current);
+            }
+            long offset = maxOffset;
+            try {
+                current.append(frame);
+            } catch (IOException e) {
+                throw new PolyConfigException(ErrorCode.STORAGE_ERROR, "追加日志失败", e);
+            }
+            maxOffset += frame.length;
+            if (config.isSyncOnAppend()) {
+                flush();
+            }
+            return offset;
+        } finally {
+            rwLock.writeLock().unlock();
         }
-        maxOffset += frame.length;
-        if (config.isSyncOnAppend()) {
-            flush();
-        }
-        return offset;
     }
 
     /**
@@ -182,20 +194,25 @@ public final class SegmentLog implements Closeable {
      * @param physicalOffset 记录起始物理 offset
      * @return 记录内容
      */
-    public synchronized byte[] read(long physicalOffset) {
-        ensureOpen();
-        Segment segment = findSegment(physicalOffset);
-        if (segment == null) {
-            throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                    "日志位点不存在: " + physicalOffset);
+    public byte[] read(long physicalOffset) {
+        rwLock.readLock().lock();
+        try {
+            ensureOpen();
+            Segment segment = findSegment(physicalOffset);
+            if (segment == null) {
+                throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                        "日志位点不存在: " + physicalOffset);
+            }
+            int localPosition = (int) (physicalOffset - segment.startOffset);
+            if (localPosition < 0 || localPosition >= segment.writePosition) {
+                throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                        "日志位点越界: " + physicalOffset);
+            }
+            DecodedFrame frame = readFrame(segment, localPosition, segment.writePosition, true);
+            return frame.payload;
+        } finally {
+            rwLock.readLock().unlock();
         }
-        int localPosition = (int) (physicalOffset - segment.startOffset);
-        if (localPosition < 0 || localPosition >= segment.writePosition) {
-            throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                    "日志位点越界: " + physicalOffset);
-        }
-        DecodedFrame frame = readFrame(segment, localPosition, segment.writePosition, true);
-        return frame.payload;
     }
 
     /**
@@ -213,27 +230,50 @@ public final class SegmentLog implements Closeable {
      * @param startOffset 起始物理 offset，必须是记录边界
      * @param visitor 记录访问器
      */
-    public synchronized void scanFrom(long startOffset, LogVisitor visitor) {
-        ensureOpen();
+    public void scanFrom(long startOffset, LogVisitor visitor) {
         Preconditions.checkNotNull(visitor, "visitor");
-        if (startOffset < 0 || startOffset > maxOffset) {
-            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                    "扫描位点越界: " + startOffset);
+        List<ScanTarget> targets;
+        long limit;
+        rwLock.readLock().lock();
+        try {
+            ensureOpen();
+            if (startOffset < 0 || startOffset > maxOffset) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "扫描位点越界: " + startOffset);
+            }
+            // 锁内只捕获段清单与各自的有效长度，实际读取与 visitor 在锁外进行
+            targets = new ArrayList<>(segments.size());
+            for (Segment segment : segments.values()) {
+                targets.add(new ScanTarget(segment, segment.writePosition));
+            }
+            limit = maxOffset;
+        } finally {
+            rwLock.readLock().unlock();
         }
         long cursor = startOffset;
-        while (cursor < maxOffset) {
-            Segment segment = findSegment(cursor);
-            if (segment == null) {
+        while (cursor < limit) {
+            ScanTarget target = findTarget(targets, cursor);
+            if (target == null) {
                 throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
                         "扫描时日志位点不存在: " + cursor);
             }
-            int localPosition = (int) (cursor - segment.startOffset);
-            DecodedFrame frame = readFrame(segment, localPosition, segment.writePosition, true);
+            int localPosition = (int) (cursor - target.segment.startOffset);
+            DecodedFrame frame = readFrame(target.segment, localPosition, target.limit, true);
             if (!visitor.onRecord(cursor, frame.payload)) {
                 return;
             }
             cursor += frame.totalLength;
         }
+    }
+
+    private static ScanTarget findTarget(List<ScanTarget> targets, long physicalOffset) {
+        for (ScanTarget target : targets) {
+            if (physicalOffset >= target.segment.startOffset
+                    && physicalOffset < target.segment.startOffset + target.limit) {
+                return target;
+            }
+        }
+        return null;
     }
 
     /**
@@ -243,7 +283,16 @@ public final class SegmentLog implements Closeable {
      *
      * @param physicalOffset 截断后的日志末尾
      */
-    public synchronized void truncateTo(long physicalOffset) {
+    public void truncateTo(long physicalOffset) {
+        rwLock.writeLock().lock();
+        try {
+            doTruncateTo(physicalOffset);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    private void doTruncateTo(long physicalOffset) {
         ensureOpen();
         if (physicalOffset < 0 || physicalOffset > maxOffset) {
             throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
@@ -293,15 +342,62 @@ public final class SegmentLog implements Closeable {
     /**
      * 强制把所有日志段刷到磁盘。
      */
-    public synchronized void flush() {
-        ensureOpen();
-        for (Segment segment : segments.values()) {
-            try {
-                segment.flush();
-            } catch (IOException e) {
-                throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                        "刷盘失败: " + segment.path, e);
+    public void flush() {
+        rwLock.writeLock().lock();
+        try {
+            ensureOpen();
+            for (Segment segment : segments.values()) {
+                try {
+                    segment.flush();
+                } catch (IOException e) {
+                    throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                            "刷盘失败: " + segment.path, e);
+                }
             }
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * 删除完全被快照覆盖的非活跃日志段。
+     *
+     * <p>只删除"段末尾 &lt;= coveredUpTo"的完整覆盖段，活跃段永不删除；
+     * 调用方必须保证 coveredUpTo 之前的日志内容已通过快照持久化。</p>
+     *
+     * @param coveredUpTo 快照已覆盖到的物理 offset
+     * @return 删除的段数
+     */
+    public int deleteSegmentsBefore(long coveredUpTo) {
+        rwLock.writeLock().lock();
+        try {
+            ensureOpen();
+            if (coveredUpTo < 0) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "覆盖位点非法: " + coveredUpTo);
+            }
+            List<Long> candidates = new ArrayList<>();
+            for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
+                Segment segment = entry.getValue();
+                if (segment == current) {
+                    break;
+                }
+                if (segment.startOffset + segment.writePosition <= coveredUpTo) {
+                    candidates.add(entry.getKey());
+                } else {
+                    break;
+                }
+            }
+            for (Long start : candidates) {
+                Segment removed = segments.remove(start);
+                if (removed != null) {
+                    closeQuietly(removed);
+                    deleteQuietly(removed.path);
+                }
+            }
+            return candidates.size();
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
 
@@ -310,7 +406,7 @@ public final class SegmentLog implements Closeable {
      *
      * @return 末尾物理 offset
      */
-    public synchronized long getMaxOffset() {
+    public long getMaxOffset() {
         return maxOffset;
     }
 
@@ -319,7 +415,7 @@ public final class SegmentLog implements Closeable {
      *
      * @return 截断终点；-1 表示未发生截断
      */
-    public synchronized long getRecoveryTruncatedOffset() {
+    public long getRecoveryTruncatedOffset() {
         return recoveryTruncatedOffset;
     }
 
@@ -328,40 +424,45 @@ public final class SegmentLog implements Closeable {
      *
      * @return 隔离文件名列表，未发生隔离时为空列表
      */
-    public synchronized List<String> getQuarantinedFiles() {
+    public List<String> getQuarantinedFiles() {
         return Collections.unmodifiableList(quarantinedFiles);
     }
 
     @Override
-    public synchronized void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        PolyConfigException failure = null;
-        for (Segment segment : segments.values()) {
-            try {
-                segment.flush();
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                            "关闭前刷盘失败: " + segment.path, e);
+    public void close() {
+        rwLock.writeLock().lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            PolyConfigException failure = null;
+            for (Segment segment : segments.values()) {
+                try {
+                    segment.flush();
+                } catch (IOException e) {
+                    if (failure == null) {
+                        failure = new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                                "关闭前刷盘失败: " + segment.path, e);
+                    }
+                }
+                try {
+                    segment.close();
+                } catch (IOException e) {
+                    if (failure == null) {
+                        failure = new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                                "关闭日志段失败: " + segment.path, e);
+                    }
                 }
             }
-            try {
-                segment.close();
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                            "关闭日志段失败: " + segment.path, e);
-                }
+            segments.clear();
+            current = null;
+            releaseLockQuietly();
+            if (failure != null) {
+                throw failure;
             }
-        }
-        segments.clear();
-        current = null;
-        releaseLockQuietly();
-        if (failure != null) {
-            throw failure;
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
 
@@ -421,14 +522,15 @@ public final class SegmentLog implements Closeable {
             return;
         }
 
-        long expectedStart = 0L;
+        long firstStart = parseStart(files.get(0));
+        if (firstStart != 0L && !config.isAllowNonZeroStart()) {
+            throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
+                    "首个日志段必须从 0 开始: " + files.get(0));
+        }
+        long expectedStart = firstStart;
         for (int i = 0; i < files.size(); i++) {
             Path file = files.get(i);
             long start = parseStart(file);
-            if (i == 0 && start != 0L) {
-                throw new PolyConfigException(ErrorCode.STORAGE_ERROR,
-                        "首个日志段必须从 0 开始: " + file);
-            }
             if (start != expectedStart) {
                 markRecoveryTruncated(expectedStart);
                 quarantineFrom(files, i,
@@ -772,6 +874,20 @@ public final class SegmentLog implements Closeable {
                 continue;
             }
             position += read;
+        }
+    }
+
+    /**
+     * 扫描时捕获的段目标：段引用 + 捕获时刻的有效长度。
+     */
+    private static final class ScanTarget {
+
+        private final Segment segment;
+        private final int limit;
+
+        private ScanTarget(Segment segment, int limit) {
+            this.segment = segment;
+            this.limit = limit;
         }
     }
 

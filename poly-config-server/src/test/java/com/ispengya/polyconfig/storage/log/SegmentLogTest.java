@@ -292,6 +292,91 @@ public class SegmentLogTest {
         }
     }
 
+    @Test
+    public void shouldDeleteCoveredSegmentsAndAllowNonZeroStart() throws Exception {
+        Path dir = folder.newFolder("compact").toPath();
+        SegmentLogConfig config = config(dir, 64, 32);
+        byte[] payload = new byte[20];
+        int frameLength = SegmentLog.FRAME_HEADER_SIZE + payload.length;
+        List<Long> offsets = new ArrayList<>();
+
+        try (SegmentLog log = new SegmentLog(config)) {
+            for (int i = 0; i < 6; i++) {
+                payload[0] = (byte) i;
+                offsets.add(log.append(payload));
+            }
+            // 段大小 64、帧 36：每段恰好 1 条，共 6 段
+            long coveredUpTo = offsets.get(2) + frameLength;
+            assertEquals(3, log.deleteSegmentsBefore(coveredUpTo));
+            // 活跃段不受影响
+            assertArrayEquals(payload, log.read(offsets.get(5)));
+        }
+        assertEquals(3, segmentNames(dir).size());
+
+        // 默认仍要求首段从 0 开始，拒绝启动
+        try (SegmentLog ignored = new SegmentLog(config)) {
+            fail("非零起点在默认配置下应拒绝启动");
+        } catch (PolyConfigException e) {
+            assertEquals(ErrorCode.STORAGE_ERROR, e.getErrorCode());
+        }
+
+        // 有快照场景：允许非零起点，剩余 3 条完整可读
+        SegmentLogConfig allowed = SegmentLogConfig.builder(dir)
+                .segmentSize(64)
+                .maxRecordSize(32)
+                .allowNonZeroStart(true)
+                .build();
+        try (SegmentLog log = new SegmentLog(allowed)) {
+            assertEquals(6L * frameLength, log.getMaxOffset());
+            // 首段已删除，只能从剩余首段起始位点扫描
+            final AtomicInteger remaining = new AtomicInteger();
+            log.scanFrom(offsets.get(3), (offset, bytes) -> {
+                remaining.incrementAndGet();
+                return true;
+            });
+            assertEquals(3, remaining.get());
+            payload[0] = (byte) 5;
+            assertArrayEquals(payload, log.read(offsets.get(5)));
+        }
+    }
+
+    @Test
+    public void shouldAppendWhileScanInProgress() throws Exception {
+        Path dir = folder.newFolder("scan-concurrent").toPath();
+        SegmentLogConfig config = config(dir, 1024, 128);
+
+        try (SegmentLog log = new SegmentLog(config)) {
+            for (int i = 0; i < 200; i++) {
+                log.append(bytes("seed-" + i));
+            }
+            final AtomicInteger scanned = new AtomicInteger();
+            Thread scanner = new Thread(() -> log.scanFrom(0L, (offset, payload) -> {
+                scanned.incrementAndGet();
+                try {
+                    Thread.sleep(1L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+                return true;
+            }));
+            scanner.start();
+            Thread.sleep(20L);
+
+            // 扫描进行中并发追加：锁外扫描，写入不应被阻塞
+            for (int i = 0; i < 50; i++) {
+                log.append(bytes("live-" + i));
+            }
+            assertTrue("追加不应等待扫描完成", scanner.isAlive());
+
+            scanner.join(30_000L);
+            // 扫描只覆盖捕获时刻的 200 条
+            assertEquals(200, scanned.get());
+            // 追加的 50 条随后可完整扫描
+            assertEquals(250, countRecords(log));
+        }
+    }
+
     private static List<String> segmentNames(Path dir) throws IOException {
         List<String> names = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.log")) {

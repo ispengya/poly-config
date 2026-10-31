@@ -181,8 +181,11 @@ public final class ServerOptions {
 
         /**
          * 监听地址。
+         *
+         * <p>默认只绑定回环地址；对外提供服务时显式传 {@code 0.0.0.0} 或具体网卡地址，
+         * 并配合防火墙/鉴权。</p>
          */
-        private String host = "0.0.0.0";
+        private String host = "127.0.0.1";
 
         /**
          * 对外展示的主机名或 IP，为空时自动探测。

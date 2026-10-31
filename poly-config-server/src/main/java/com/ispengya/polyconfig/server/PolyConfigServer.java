@@ -108,7 +108,7 @@ public class PolyConfigServer {
                 options.getClusterId(), options.getHistoryLimit());
         this.configService = new ConfigService(protocol);
         this.registry = new SubscriptionRegistry();
-        this.remotingServer = new NettyRemotingServer(options.getRemotingPort());
+        this.remotingServer = new NettyRemotingServer(options.getHost(), options.getRemotingPort());
         this.httpServer = HttpServer.create(
                 new InetSocketAddress(options.getHost(), options.getHttpPort()), 0);
         this.httpExecutor = Executors.newFixedThreadPool(16,

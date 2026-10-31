@@ -16,8 +16,16 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -215,6 +223,155 @@ public class CoreChainIntegrationTest {
         }
     }
 
+    @Test
+    public void shouldSnapshotCompactAndRecoverOnRestart() throws Exception {
+        Path dataDir = folder.newFolder("snapshot-data").toPath();
+        PolyConfigServer server = startServer(dataDir, 5, 0, 0);
+        long lastRevision = 0L;
+        try {
+            for (int i = 1; i <= 12; i++) {
+                Response response = post(server.getHttpPort(), "/v1/cs/configs",
+                        publishBody("app-" + i + ".yml", "v" + i, null));
+                assertEquals(200, response.status);
+                lastRevision = JSON.parseObject(response.body)
+                        .getJSONObject("data").getLongValue("revision");
+            }
+            assertTrue("快照未在超时内生成", waitForSnapshot(dataDir.resolve("snapshot"), 8000L));
+            // 快照覆盖的前缀段应被清理（12 条命令不应保留 12 个段文件）
+            assertTrue("日志前缀段未被清理", countSegments(dataDir.resolve("log")) < 12);
+        } finally {
+            server.stop();
+        }
+
+        PolyConfigServer restarted = startServer(dataDir, 5, 0, 0);
+        try {
+            for (int i = 1; i <= 12; i++) {
+                Response response = get(restarted.getHttpPort(),
+                        "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=app-"
+                                + i + ".yml");
+                assertEquals(200, response.status);
+                assertEquals("v" + i, JSON.parseObject(response.body)
+                        .getJSONObject("data").getString("content"));
+            }
+            // 快照恢复后 per-key revision 精确延续：
+            // app-12.yml 是全局序号 12 写入的，基于它做乐观锁发布必须成功
+            Response next = post(restarted.getHttpPort(), "/v1/cs/configs",
+                    publishBody("app-12.yml", "v12-next", lastRevision));
+            assertEquals("lastRevision=" + lastRevision + ", body=" + next.body,
+                    200, next.status);
+        } finally {
+            restarted.stop();
+        }
+    }
+
+    @Test
+    public void shouldCompleteConcurrentPublishesWithDistinctRevisions() throws Exception {
+        Path dataDir = folder.newFolder("concurrent-data").toPath();
+        PolyConfigServer server = startServer(dataDir);
+        int threads = 8;
+        int perThread = 25;
+        try {
+            Set<Integer> revisions = ConcurrentHashMap.newKeySet();
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            try {
+                List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+                for (int t = 0; t < threads; t++) {
+                    final int threadId = t;
+                    futures.add(pool.submit(() -> {
+                        for (int j = 0; j < perThread; j++) {
+                            Response response;
+                            try {
+                                response = post(server.getHttpPort(), "/v1/cs/configs",
+                                        publishBody("k-" + threadId + "-" + j, "value-" + j, null));
+                            } catch (IOException e) {
+                                throw new IllegalStateException(e);
+                            }
+                            assertEquals(200, response.status);
+                            revisions.add(JSON.parseObject(response.body)
+                                    .getJSONObject("data").getIntValue("revision"));
+                        }
+                        return null;
+                    }));
+                }
+                for (java.util.concurrent.Future<?> future : futures) {
+                    future.get(60, TimeUnit.SECONDS);
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+            // 组提交下所有命令 revision 互不重复且连续 1..N
+            assertEquals(threads * perThread, revisions.size());
+        } finally {
+            server.stop();
+        }
+
+        // 重启后抽查内容完整
+        PolyConfigServer restarted = startServer(dataDir);
+        try {
+            for (int t = 0; t < threads; t++) {
+                Response response = get(restarted.getHttpPort(),
+                        "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=k-"
+                                + t + "-0");
+                assertEquals(200, response.status);
+                assertEquals("value-0", JSON.parseObject(response.body)
+                        .getJSONObject("data").getString("content"));
+            }
+        } finally {
+            restarted.stop();
+        }
+    }
+
+    @Test
+    public void shouldRebindPortsAfterGracefulStop() throws Exception {
+        Path dataDir = folder.newFolder("stop-data").toPath();
+        PolyConfigServer first = startServer(dataDir);
+        int httpPort = first.getHttpPort();
+        int remotingPort = first.getRemotingPort();
+        assertEquals(200, post(httpPort, "/v1/cs/configs", publishJson("v1")).status);
+        first.stop();
+
+        // 优雅停机后端口已释放、数据完整：同端口同目录立即重启
+        PolyConfigServer second = startServer(dataDir, 0, httpPort, remotingPort);
+        try {
+            assertEquals(httpPort, second.getHttpPort());
+            Response response = get(httpPort,
+                    "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=app.yml");
+            assertEquals(200, response.status);
+            assertEquals("v1", JSON.parseObject(response.body)
+                    .getJSONObject("data").getString("content"));
+        } finally {
+            second.stop();
+        }
+    }
+
+    private static boolean waitForSnapshot(Path dir, long timeoutMillis) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (Files.isDirectory(dir)) {
+                try (DirectoryStream<Path> stream =
+                             Files.newDirectoryStream(dir, "snapshot-*.json")) {
+                    if (stream.iterator().hasNext()) {
+                        return true;
+                    }
+                } catch (IOException ignored) {
+                    // 目录尚未就绪，继续等待
+                }
+            }
+            Thread.sleep(50L);
+        }
+        return false;
+    }
+
+    private static int countSegments(Path dir) throws IOException {
+        int count = 0;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.log")) {
+            for (Path ignored : stream) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private static String publishJsonWithExpectedVersion(String content, long expectedVersion) {
         JSONObject request = JSONObject.parseObject(publishJson(content));
         request.put("expectedVersion", expectedVersion);
@@ -222,15 +379,21 @@ public class CoreChainIntegrationTest {
     }
 
     private static PolyConfigServer startServer(Path dataDir) throws IOException {
+        return startServer(dataDir, 0, 0, 0);
+    }
+
+    private static PolyConfigServer startServer(Path dataDir, int snapshotThreshold,
+                                                int httpPort, int remotingPort) throws IOException {
         ServerOptions options = ServerOptions.builder()
                 .host("127.0.0.1")
                 // 固定对外地址，避免 NetworkUtils 在有网卡的机器上探测成局域网 IP 导致断言失败
                 .advertiseHost("127.0.0.1")
-                .httpPort(0)
-                .remotingPort(0)
+                .httpPort(httpPort)
+                .remotingPort(remotingPort)
                 .dataDir(dataDir)
                 .nodeId("node-1")
                 .clusterId("test-cluster")
+                .snapshotThreshold(snapshotThreshold)
                 .build();
         PolyConfigServer server = new PolyConfigServer(options);
         server.start();
@@ -247,13 +410,20 @@ public class CoreChainIntegrationTest {
     }
 
     private static String publishJson(String content) {
+        return publishBody("app.yml", content, null);
+    }
+
+    private static String publishBody(String dataId, String content, Long expectedVersion) {
         JSONObject request = new JSONObject();
         request.put("namespace", "public");
         request.put("group", "DEFAULT_GROUP");
-        request.put("dataId", "app.yml");
+        request.put("dataId", dataId);
         request.put("content", content);
         request.put("type", "YAML");
         request.put("operator", "tester");
+        if (expectedVersion != null) {
+            request.put("expectedVersion", expectedVersion);
+        }
         return request.toJSONString();
     }
 

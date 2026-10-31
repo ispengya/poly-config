@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -212,6 +213,51 @@ public class ConfigStateMachine implements StateMachine {
     @Override
     public void removeChangeListener(ChangeListener listener) {
         listeners.remove(listener);
+    }
+
+    /**
+     * 导出全部当前配置（供快照捕获，浅拷贝）。
+     *
+     * @return 当前配置列表
+     */
+    public List<ConfigEntry> exportEntries() {
+        return new ArrayList<>(current.values());
+    }
+
+    /**
+     * 导出全部历史（供快照捕获，每 key 拷贝，新的在前）。
+     *
+     * @return 历史表
+     */
+    public Map<ConfigKey, List<HistoryEntry>> exportHistories() {
+        Map<ConfigKey, List<HistoryEntry>> result = new ConcurrentHashMap<>();
+        for (Map.Entry<ConfigKey, Deque<HistoryEntry>> entry : histories.entrySet()) {
+            synchronized (entry.getValue()) {
+                result.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 从快照恢复状态（仅供启动期、单线程场景调用）。
+     *
+     * @param entries 当前配置
+     * @param historyLists 每 key 历史，新的在前
+     */
+    public void restore(List<ConfigEntry> entries, Map<ConfigKey, List<HistoryEntry>> historyLists) {
+        current.clear();
+        histories.clear();
+        if (entries != null) {
+            for (ConfigEntry entry : entries) {
+                current.put(entry.getKey(), entry);
+            }
+        }
+        if (historyLists != null) {
+            for (Map.Entry<ConfigKey, List<HistoryEntry>> entry : historyLists.entrySet()) {
+                histories.put(entry.getKey(), new ArrayDeque<>(entry.getValue()));
+            }
+        }
     }
 
     private static String normalize(String value, String defaultValue) {

@@ -52,6 +52,11 @@ public final class ServerOptions {
     private final int historyLimit;
 
     /**
+     * 快照触发阈值（命令条数），0 表示关闭快照。
+     */
+    private final int snapshotThreshold;
+
+    /**
      * 运行模式。
      */
     private final String mode;
@@ -65,6 +70,7 @@ public final class ServerOptions {
         this.nodeId = builder.nodeId;
         this.clusterId = builder.clusterId;
         this.historyLimit = builder.historyLimit;
+        this.snapshotThreshold = builder.snapshotThreshold;
         this.mode = builder.mode;
     }
 
@@ -127,6 +133,9 @@ public final class ServerOptions {
                 case "history-limit":
                     builder.historyLimit(Integer.parseInt(value));
                     break;
+                case "snapshot-threshold":
+                    builder.snapshotThreshold(Integer.parseInt(value));
+                    break;
                 case "mode":
                     builder.mode(value);
                     break;
@@ -168,6 +177,10 @@ public final class ServerOptions {
 
     public int getHistoryLimit() {
         return historyLimit;
+    }
+
+    public int getSnapshotThreshold() {
+        return snapshotThreshold;
     }
 
     public String getMode() {
@@ -223,6 +236,11 @@ public final class ServerOptions {
         private int historyLimit = 100;
 
         /**
+         * 快照触发阈值（命令条数），0 表示关闭快照。
+         */
+        private int snapshotThreshold = 10000;
+
+        /**
          * 运行模式。
          */
         private String mode = "standalone";
@@ -267,6 +285,11 @@ public final class ServerOptions {
             return this;
         }
 
+        public Builder snapshotThreshold(int snapshotThreshold) {
+            this.snapshotThreshold = snapshotThreshold;
+            return this;
+        }
+
         public Builder mode(String mode) {
             this.mode = mode;
             return this;
@@ -295,6 +318,10 @@ public final class ServerOptions {
             }
             if (historyLimit <= 0) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "historyLimit 必须大于 0");
+            }
+            if (snapshotThreshold < 0) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "snapshotThreshold 不能为负数");
             }
             if (mode == null || mode.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "mode 不能为空");

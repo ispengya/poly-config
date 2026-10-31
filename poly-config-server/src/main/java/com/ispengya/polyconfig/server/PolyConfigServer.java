@@ -22,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -105,7 +106,8 @@ public class PolyConfigServer {
         }
         this.options = options;
         this.protocol = new LocalProtocol(options.getDataDir(), options.getNodeId(),
-                options.getClusterId(), options.getHistoryLimit());
+                options.getClusterId(), options.getHistoryLimit(),
+                options.getSnapshotThreshold());
         this.configService = new ConfigService(protocol);
         this.registry = new SubscriptionRegistry();
         this.remotingServer = new NettyRemotingServer(options.getHost(), options.getRemotingPort());
@@ -152,20 +154,48 @@ public class PolyConfigServer {
 
     /**
      * 停止服务端，幂等。
+     *
+     * <p>按序优雅停机：先停 HTTP 接收并等待在途请求，再停 remoting 并等待
+     * event loop 退出，然后关闭协议（最终快照 + 日志落盘），最后收线程池，
+     * 每步都有超时兜底。</p>
      */
     public synchronized void stop() {
         if (stopped) {
             return;
         }
+        long start = System.currentTimeMillis();
         stopped = true;
         configService.removeChangeListener(changePusher);
-        httpServer.stop(0);
+        // 1) 停止接收新 HTTP 请求，等待在途请求完成。
+        // 注意：JDK HttpServer.stop(delay) 会实打实等待 delay 秒，取 2 秒作为折中
+        httpServer.stop(2);
+        // 2) 停止接收新长连接，等待 event loop 退出（最多 5 秒）
         remotingServer.shutdown();
+        try {
+            remotingServer.awaitTermination(5000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("等待 remoting 停机被中断");
+        }
+        // 3) 关闭协议：最终快照 + 日志刷盘 + 释放文件锁
         configService.close();
-        httpExecutor.shutdownNow();
-        remotingExecutor.shutdownNow();
+        // 4) 线程池收尾
+        shutdownPool(httpExecutor, 3000L);
+        shutdownPool(remotingExecutor, 3000L);
         started = false;
-        log.info("poly-config stopped");
+        log.info("poly-config stopped in {}ms", System.currentTimeMillis() - start);
+    }
+
+    private static void shutdownPool(ExecutorService pool, long timeoutMillis) {
+        pool.shutdown();
+        try {
+            if (!pool.awaitTermination(timeoutMillis, TimeUnit.MILLISECONDS)) {
+                pool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            pool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

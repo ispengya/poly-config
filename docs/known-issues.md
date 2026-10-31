@@ -2,7 +2,7 @@
 
 > 范围：M0 单机核心链路
 > 更新：2026-10-31（逐项对照代码核实）
-> 状态：已核实——ISSUE-01、02、03、04、05、15 已修复；其余未修复；修复顺序见下节
+> 状态：已核实——ISSUE-01、02、03、04、05、06、07、15、17、18 已修复；其余未修复；修复顺序见下节
 
 ## 优先级
 
@@ -21,8 +21,8 @@
 | ISSUE-03 | P0 | 客户端 | 同一配置的监听回调可能乱序（已修复，2026-10-31） | 监听器看到旧值晚于新值 |
 | ISSUE-04 | P0 | 存储 | 恢复截断静默删除后续段（已修复，2026-10-31） | 数据丢失不可审计 |
 | ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权（已修复：默认回环，2026-10-31） | 局域网内可读写 |
-| ISSUE-06 | P1 | 存储 | 无快照与日志前缀压缩 | 日志无限增长、重启变慢 |
-| ISSUE-07 | P1 | 性能 | 每条命令 fsync，无 group commit | 写吞吐受磁盘延迟限制 |
+| ISSUE-06 | P1 | 存储 | 无快照与日志前缀压缩（已修复，2026-10-31） | 日志无限增长、重启变慢 |
+| ISSUE-07 | P1 | 性能 | 每条命令 fsync，无 group commit（已修复，2026-10-31） | 写吞吐受磁盘延迟限制 |
 | ISSUE-08 | P1 | 推送 | 无 UNSUBSCRIBE，移除监听后仍推送 | 无效推送与资源浪费 |
 | ISSUE-09 | P1 | 推送 | 单连接订阅数无上限 | 推送遍历与内存膨胀 |
 | ISSUE-10 | P1 | 客户端 | 定时对账逐 key 同步请求 | 订阅多时对账很慢 |
@@ -32,8 +32,8 @@
 | ISSUE-14 | P1 | 接口 | list / history 无分页 | 大数据量响应过大 |
 | ISSUE-15 | P1 | 核心 | 无并发写冲突检测（已修复，2026-10-31） | 后写静默覆盖先写 |
 | ISSUE-16 | P1 | 运维 | 可观测性不足 | 故障定位困难 |
-| ISSUE-17 | P1 | 存储 | SegmentLog 全局同步，scan 阻塞写 | 大日志扫描阻塞写入 |
-| ISSUE-18 | P1 | 运维 | 关闭流程不等待 graceful shutdown | 在途请求失败、端口释放慢 |
+| ISSUE-17 | P1 | 存储 | SegmentLog 全局同步，scan 阻塞写（已修复，2026-10-31） | 大日志扫描阻塞写入 |
+| ISSUE-18 | P1 | 运维 | 关闭流程不等待 graceful shutdown（已修复，2026-10-31） | 在途请求失败、端口释放慢 |
 | ISSUE-19 | P2 | 安全 | 无鉴权、TLS、限流 | 任意客户端可读写 |
 | ISSUE-20 | P2 | 安全 | 配置与客户端快照明文落盘 | 敏感配置泄露 |
 | ISSUE-21 | P2 | 审计 | 无身份与审计日志 | 变更无法追责 |
@@ -46,13 +46,13 @@
 ## 修复顺序（2026-10-31 核实后，围绕单机核心链路）
 
 > 单机核心链路 = 写入（客户端 → HTTP/remoting → propose → SegmentLog）+ 订阅/推送 + 重启恢复。
-> 核实结论：ISSUE-01、02、03、04、05、15 已修复且有测试覆盖；其余 20 项未修复（其中 ISSUE-11、25
-> 有部分进展，已并入对应条目）。
+> 核实结论：ISSUE-01、02、03、04、05、06、07、15、17、18 已修复且有测试覆盖；其余 16 项未修复
+> （其中 ISSUE-11、25 有部分进展，已并入对应条目）。
 
 | 梯队 | 顺序 | 条目 | 理由 |
 |---|---|---|---|
 | T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（全部已修，2026-10-31） | T1 清零 |
-| T2 性能/可靠性 | 5→8 | ISSUE-07 → 06 → 17 → 18 | group commit 提吞吐；快照的隔离前置（ISSUE-04）已就位；锁分离为快照扫描铺路 |
+| T2 性能/可靠性 | 5→8 | ISSUE-07 → 17 → 06 → 18（全部已修，2026-10-31） | T2 清零；实施顺序按锁分离先于快照调整 |
 | T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13 | ISSUE-13 体量小，可顺手提前 |
 | T4 外围 | — | 其余（12/14/16/19-26） | 非核心链路，暂缓 |
 
@@ -124,21 +124,35 @@
   `ServerOptionsTest` 与 remoting-core 的 `RemotingTest.loopbackBoundServerRejectsLanAccess`。
   鉴权、TLS、限流仍由 ISSUE-19 跟进。
 
-### ISSUE-06 无快照与日志前缀压缩
+### ISSUE-06 无快照与日志前缀压缩（已修复，2026-10-31）
 
 - 位置：`poly-config-core` 的 `LocalProtocol` 构造；`poly-config-storage`
 - 现状：启动时 `SegmentLog.scan` 全量回放；存储层没有快照，也没有删除前缀段的能力。
 - 风险：日志持续增长，重启时间线性增加；历史数据无法按快照压缩。
 - 建议：增加 `SnapshotStore`（原子快照 + 版本号）和日志前缀压缩/epoch 目录；启动时加载最新快照再回放增量。
 - 验证：写入大量命令后重启，比较回放条数与启动耗时；快照后旧段可删除。
+- 修复：新增 `storage/snapshot` 包（`SnapshotStore` + DTO，JSON 原子写、保留 2 份防唯一快照损坏、
+  `formatVersion` 校验）。快照含 entries + histories + **全局 revision + 日志位点**；`propose` 锁内
+  O(n) 浅拷贝捕获、快照线程序列化落盘；触发挂在当次命令的 offset future 上，由组提交线程在
+  **刷盘后**补齐位点，保证快照位点之前的日志已持久化，落盘成功后才调用
+  `SegmentLog.deleteSegmentsBefore` 删除完整覆盖段（顺序不可逆）。启动时加载最新可用快照注入
+  `ConfigStateMachine.restore`，再 `scanFrom(快照位点)` 回放增量；首段允许非零起点
+  （`SegmentLogConfig.allowNonZeroStart`）。关闭时做最终快照。阈值 `--snapshot-threshold`
+  （默认 10000，0 关闭）。测试见 `CoreChainIntegrationTest.shouldSnapshotCompactAndRecoverOnRestart`、
+  `SegmentLogTest.shouldDeleteCoveredSegmentsAndAllowNonZeroStart`。
 
-### ISSUE-07 每条命令 fsync，无 group commit
+### ISSUE-07 每条命令 fsync，无 group commit（已修复，2026-10-31）
 
 - 位置：`LocalProtocol.propose`
 - 现状：每次 `append` 后立即 `flush`，一条命令一次 fsync。
 - 风险：写吞吐受磁盘 fsync 延迟限制，发布频率高时延迟明显。
 - 建议：实现 group commit：批量追加，统一 force 后再批量应答；必须保证应答前已持久化。
 - 验证：压测不同批量大小下的写吞吐和 p99 延迟。
+- 修复：`propose` 在锁内完成版本校验、内存 apply 与**锁内入队**（保证日志顺序=revision 顺序，
+  否则快照位点会错位导致回放重复应用），随后并发等待；组提交线程批量追加、一轮一次
+  `flush`、刷盘后统一应答（应答前必持久化）。刷盘失败进入 fail-stop（拒绝后续写入，
+  重启由恢复流程兜底）。测试见
+  `CoreChainIntegrationTest.shouldCompleteConcurrentPublishesWithDistinctRevisions`。
 
 ### ISSUE-08 无 UNSUBSCRIBE，移除监听后仍推送
 
@@ -220,21 +234,30 @@
 - 建议：增加基础指标（计数器/直方图）和集群状态字段；后续接 Prometheus 或自研面板。
 - 验证：压测和故障注入时能从指标看到变化。
 
-### ISSUE-17 SegmentLog 全局同步，scan 阻塞写
+### ISSUE-17 SegmentLog 全局同步，scan 阻塞写（已修复，2026-10-31）
 
 - 位置：`SegmentLog` 的 `synchronized` 方法和 `scanFrom`
 - 现状：追加、读取、扫描、截断共用同一个锁；扫描期间 visitor 执行也持锁。
 - 风险：长扫描会阻塞写入；后续 Raft 快照扫描会更明显。
 - 建议：读写分离或扫描时生成稳定快照后释放锁；协议层再配合批量读取。
 - 验证：扫描大日志时并发写入，测量写延迟。
+- 修复：改为 `ReentrantReadWriteLock`——追加/刷盘/截断/前缀删除持写锁，读取持读锁；
+  `scanFrom` 只在锁内捕获段清单与有效长度，实际读帧与 visitor 回调在**锁外**执行，
+  长扫描不再阻塞写入。测试见 `SegmentLogTest.shouldAppendWhileScanInProgress`。
 
-### ISSUE-18 关闭流程不等待 graceful shutdown
+### ISSUE-18 关闭流程不等待 graceful shutdown（已修复，2026-10-31）
 
 - 位置：`PolyConfigServer.stop`、`PolyConfigClient.close`
 - 现状：`httpServer.stop(0)` 立即停止，`remotingServer.shutdown()` 不等待 event loop 结束；客户端也不等待。
 - 风险：在途请求被中断，测试中端口释放有时序问题。
 - 建议：先停止接收新请求，再等待在途请求和 Netty 线程池退出，设置超时兜底。
 - 验证：关闭时并发请求，确认要么成功要么得到明确失败，端口及时释放。
+- 修复：`stop` 按序执行：`httpServer.stop(2)` 停收并等待在途（注意 JDK 实现会实打实等待
+  delay 秒，取 2 秒折中）→ `remotingServer.shutdown()` + `awaitTermination(5s)`（remoting-core
+  0.2.2 新增）→ `configService.close()`（协议最终快照 + 日志落盘 + 释放文件锁）→ 线程池
+  `shutdown` + `awaitTermination(3s)` 兜底 `shutdownNow`。测试见
+  `CoreChainIntegrationTest.shouldRebindPortsAfterGracefulStop`（同端口同目录停机后立即重启）。
+  客户端 close 保持现状（其线程均为 daemon，进程退出不被阻塞）。
 
 ### ISSUE-19 无鉴权、TLS、限流
 

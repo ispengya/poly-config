@@ -170,9 +170,62 @@ public class CoreChainIntegrationTest {
         }
     }
 
+    @Test
+    public void shouldRejectVersionConflict() throws Exception {
+        Path dataDir = folder.newFolder("conflict-data").toPath();
+        PolyConfigServer server = startServer(dataDir);
+        try {
+            // 首次创建：expectedVersion=-1 表示"必须不存在"，应成功
+            Response created = post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJsonWithExpectedVersion("v1", -1L));
+            assertEquals(200, created.status);
+
+            // 再次以"必须不存在"创建同一 key，应冲突
+            Response recreate = post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJsonWithExpectedVersion("v2", -1L));
+            assertEquals(409, recreate.status);
+            assertEquals(40901, JSON.parseObject(recreate.body).getIntValue("code"));
+
+            Response current = get(server.getHttpPort(),
+                    "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=app.yml");
+            long revision = JSON.parseObject(current.body)
+                    .getJSONObject("data").getLongValue("revision");
+
+            // 过期版本发布应冲突，且内容保持不变
+            Response stale = post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJsonWithExpectedVersion("v2", revision - 1));
+            assertEquals(409, stale.status);
+            assertEquals("v1", JSON.parseObject(current.body)
+                    .getJSONObject("data").getString("content"));
+
+            // 基于当前版本发布应成功
+            Response updated = post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJsonWithExpectedVersion("v2", revision));
+            assertEquals(200, updated.status);
+            Response after = get(server.getHttpPort(),
+                    "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=app.yml");
+            assertEquals("v2", JSON.parseObject(after.body)
+                    .getJSONObject("data").getString("content"));
+
+            // 不带 expectedVersion 的传统发布向后兼容，直接放行
+            Response legacy = post(server.getHttpPort(), "/v1/cs/configs", publishJson("v3"));
+            assertEquals(200, legacy.status);
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static String publishJsonWithExpectedVersion(String content, long expectedVersion) {
+        JSONObject request = JSONObject.parseObject(publishJson(content));
+        request.put("expectedVersion", expectedVersion);
+        return request.toJSONString();
+    }
+
     private static PolyConfigServer startServer(Path dataDir) throws IOException {
         ServerOptions options = ServerOptions.builder()
                 .host("127.0.0.1")
+                // 固定对外地址，避免 NetworkUtils 在有网卡的机器上探测成局域网 IP 导致断言失败
+                .advertiseHost("127.0.0.1")
                 .httpPort(0)
                 .remotingPort(0)
                 .dataDir(dataDir)

@@ -2,7 +2,7 @@
 
 > 范围：M0 单机核心链路
 > 更新：2026-10-31（逐项对照代码核实）
-> 状态：已核实——ISSUE-01、04 已修复；其余未修复；修复顺序见下节
+> 状态：已核实——ISSUE-01、04、15 已修复；其余未修复；修复顺序见下节
 
 ## 优先级
 
@@ -30,7 +30,7 @@
 | ISSUE-12 | P1 | 核心 | 历史只存在内存、按条数截断 | 不能长期审计 |
 | ISSUE-13 | P1 | 接口 | HTTP 请求体无大小限制 | 内存压力与 DoS 风险 |
 | ISSUE-14 | P1 | 接口 | list / history 无分页 | 大数据量响应过大 |
-| ISSUE-15 | P1 | 核心 | 无并发写冲突检测 | 后写静默覆盖先写 |
+| ISSUE-15 | P1 | 核心 | 无并发写冲突检测（已修复，2026-10-31） | 后写静默覆盖先写 |
 | ISSUE-16 | P1 | 运维 | 可观测性不足 | 故障定位困难 |
 | ISSUE-17 | P1 | 存储 | SegmentLog 全局同步，scan 阻塞写 | 大日志扫描阻塞写入 |
 | ISSUE-18 | P1 | 运维 | 关闭流程不等待 graceful shutdown | 在途请求失败、端口释放慢 |
@@ -46,12 +46,12 @@
 ## 修复顺序（2026-10-31 核实后，围绕单机核心链路）
 
 > 单机核心链路 = 写入（客户端 → HTTP/remoting → propose → SegmentLog）+ 订阅/推送 + 重启恢复。
-> 核实结论：ISSUE-01、ISSUE-04 已修复且有测试覆盖；其余 24 项未修复（其中 ISSUE-11、15、25
+> 核实结论：ISSUE-01、ISSUE-04、ISSUE-15 已修复且有测试覆盖；其余 23 项未修复（其中 ISSUE-11、25
 > 有部分进展，已并入对应条目）。ISSUE-05 经核实 remoting 端口无视 `--host`，修复范围扩大。
 
 | 梯队 | 顺序 | 条目 | 理由 |
 |---|---|---|---|
-| T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15 | 配置回退、默认暴露（需连带修 remoting 绑定）、回调乱序；ISSUE-15 骨架已在，成本最低 |
+| T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（已修） | 配置回退、默认暴露（需连带修 remoting 绑定）、回调乱序；ISSUE-15 已于 2026-10-31 修复 |
 | T2 性能/可靠性 | 5→8 | ISSUE-07 → 06 → 17 → 18 | group commit 提吞吐；快照的隔离前置（ISSUE-04）已就位；锁分离为快照扫描铺路 |
 | T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13 | ISSUE-13 体量小，可顺手提前 |
 | T4 外围 | — | 其余（12/14/16/19-26） | 非核心链路，暂缓 |
@@ -186,15 +186,19 @@
 - 建议：增加 `page`/`size` 或游标分页；history 已有 limit，补充偏移/游标。
 - 验证：大量配置下分页读取，响应大小稳定。
 
-### ISSUE-15 无并发写冲突检测
+### ISSUE-15 无并发写冲突检测（已修复，2026-10-31）
 
 - 位置：`ConfigService.publish`、`ConfigCommand`
 - 现状：发布总是覆盖当前值，没有 `expectedVersion`。
-  部分进展（2026-10-31 核实）：`VERSION_CONFLICT(40901)` 错误码与 HTTP 409 映射已存在
-  （`ErrorCode`、`ApiHandler`），只缺 `ConfigCommand.expectedVersion` 字段与状态机校验。
 - 风险：两个控制台同时编辑，后提交者静默覆盖前者。
 - 建议：发布请求支持可选 `expectedVersion`，状态机校验不匹配返回 `VERSION_CONFLICT`。
 - 验证：两个客户端基于同一版本发布，第二个收到 409。
+- 修复：`ConfigCommand` 增加可选 `expectedVersion`（null 不检查，-1 表示必须不存在）；
+  `LocalProtocol.propose` 在持锁状态下、追加日志之前校验，不匹配抛 `VERSION_CONFLICT`
+  （HTTP 409）。字段不参与 `CommandCodec` 编码，存储格式与回放行为不变，回放命令不携带
+  期望版本、不会重复校验。HTTP `POST /v1/cs/configs` 请求体支持可选 `expectedVersion`。
+  测试见 `CoreChainIntegrationTest.shouldRejectVersionConflict`；顺带固化集成测试
+  `advertiseHost` 为回环地址，修复有网卡机器上的断言失败。
 
 ### ISSUE-16 可观测性不足
 

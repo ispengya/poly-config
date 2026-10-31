@@ -40,6 +40,16 @@ public final class ConfigCommand {
     private final long timestamp;
 
     /**
+     * 乐观锁期望版本；{@code null} 表示不检查。
+     *
+     * <p>{@code -1} 表示"配置必须不存在"；其他值必须等于配置当前 revision。
+     * 该字段是写入前的前置条件，由协议层在追加日志之前校验，因此不参与
+     * {@code CommandCodec} 编码——日志中只存校验通过的命令，回放时不重复校验，
+     * 存储格式保持不变。</p>
+     */
+    private final Long expectedVersion;
+
+    /**
      * 创建配置命令。
      *
      * @param operation 变更操作
@@ -51,12 +61,29 @@ public final class ConfigCommand {
      */
     public ConfigCommand(ConfigOperation operation, ConfigKey key, String content,
                          ConfigType type, String operator, long timestamp) {
+        this(operation, key, content, type, operator, timestamp, null);
+    }
+
+    /**
+     * 创建带乐观锁期望版本的配置命令。
+     *
+     * @param operation 变更操作
+     * @param key 配置键
+     * @param content 配置内容
+     * @param type 内容类型
+     * @param operator 操作人
+     * @param timestamp 命令创建时间
+     * @param expectedVersion 期望版本；{@code null} 表示不检查，{@code -1} 表示必须不存在
+     */
+    public ConfigCommand(ConfigOperation operation, ConfigKey key, String content,
+                         ConfigType type, String operator, long timestamp, Long expectedVersion) {
         this.operation = Objects.requireNonNull(operation, "operation");
         this.key = Objects.requireNonNull(key, "key");
         this.content = content == null ? "" : content;
         this.type = type == null ? ConfigType.TEXT : type;
         this.operator = operator == null ? "" : operator;
         this.timestamp = timestamp;
+        this.expectedVersion = expectedVersion;
     }
 
     /**
@@ -121,5 +148,9 @@ public final class ConfigCommand {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public Long getExpectedVersion() {
+        return expectedVersion;
     }
 }

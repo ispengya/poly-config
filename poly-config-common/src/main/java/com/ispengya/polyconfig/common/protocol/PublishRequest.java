@@ -35,6 +35,11 @@ public class PublishRequest {
      */
     private String operator;
 
+    /**
+     * 乐观锁期望版本；为空表示不检查，-1 表示配置必须不存在。
+     */
+    private Long expectedVersion;
+
     public PublishRequest() {
     }
 
@@ -84,5 +89,13 @@ public class PublishRequest {
 
     public void setOperator(String operator) {
         this.operator = operator;
+    }
+
+    public Long getExpectedVersion() {
+        return expectedVersion;
+    }
+
+    public void setExpectedVersion(Long expectedVersion) {
+        this.expectedVersion = expectedVersion;
     }
 }

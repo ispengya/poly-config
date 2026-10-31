@@ -51,9 +51,28 @@ public class ConfigService {
      */
     public MutationResult publish(String namespace, String group, String dataId,
                                   String content, String type, String operator) {
+        return publish(namespace, group, dataId, content, type, operator, null);
+    }
+
+    /**
+     * 发布配置（带乐观锁期望版本）。
+     *
+     * @param namespace 命名空间
+     * @param group 分组
+     * @param dataId 配置项 ID
+     * @param content 配置内容
+     * @param type 内容类型
+     * @param operator 操作人
+     * @param expectedVersion 期望版本；{@code null} 表示不检查，{@code -1} 表示必须不存在
+     * @return 提交结果
+     */
+    public MutationResult publish(String namespace, String group, String dataId,
+                                  String content, String type, String operator,
+                                  Long expectedVersion) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
-        ConfigCommand command = ConfigCommand.publish(key, content == null ? "" : content,
-                ConfigType.fromSupported(type), normalizeOperator(operator));
+        ConfigCommand command = new ConfigCommand(ConfigOperation.PUBLISH, key,
+                content == null ? "" : content, ConfigType.fromSupported(type),
+                normalizeOperator(operator), System.currentTimeMillis(), expectedVersion);
         return protocol.propose(command);
     }
 

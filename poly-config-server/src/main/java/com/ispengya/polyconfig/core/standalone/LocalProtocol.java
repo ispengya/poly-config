@@ -141,6 +141,7 @@ public class LocalProtocol implements ConfigProtocol {
     @Override
     public synchronized MutationResult propose(ConfigCommand command) {
         ensureOpen();
+        checkExpectedVersion(command);
         byte[] payload = CommandCodec.encode(command);
         segmentLog.append(payload);
         segmentLog.flush();
@@ -149,6 +150,30 @@ public class LocalProtocol implements ConfigProtocol {
         String md5 = command.getOperation() == ConfigOperation.DELETE
                 ? "" : Md5Utils.md5Hex(command.getContent());
         return new MutationResult(command.getKey(), revision, revision, md5);
+    }
+
+    /**
+     * 校验乐观锁期望版本。
+     *
+     * <p>在追加日志之前、持锁状态下执行，保证"检查-写入"原子；
+     * 校验不通过抛 {@code VERSION_CONFLICT}，命令不会进入日志。
+     * 回放路径不携带 expectedVersion，不会重复校验。</p>
+     *
+     * @param command 待校验命令
+     */
+    private void checkExpectedVersion(ConfigCommand command) {
+        Long expected = command.getExpectedVersion();
+        if (expected == null) {
+            return;
+        }
+        long current = stateMachine.get(command.getKey())
+                .map(entry -> entry.getRevision())
+                .orElse(-1L);
+        if (expected.longValue() != current) {
+            throw new PolyConfigException(ErrorCode.VERSION_CONFLICT,
+                    "配置版本冲突: key=" + command.getKey()
+                            + ", expected=" + expected + ", current=" + current);
+        }
     }
 
     @Override

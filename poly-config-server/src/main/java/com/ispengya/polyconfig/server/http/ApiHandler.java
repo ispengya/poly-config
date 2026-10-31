@@ -171,7 +171,8 @@ public class ApiHandler implements HttpHandler {
         }
         writeJson(exchange, 200, ApiResponse.ok(configService.publish(
                 request.getNamespace(), request.getGroup(), request.getDataId(),
-                request.getContent(), request.getType(), request.getOperator())));
+                request.getContent(), request.getType(), request.getOperator(),
+                request.getExpectedVersion())));
     }
 
     private void handleDeleteConfig(HttpExchange exchange) throws IOException {

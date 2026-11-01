@@ -1,8 +1,8 @@
 # poly-config 已知问题清单
 
 > 范围：M0 单机核心链路
-> 更新：2026-11-01（T3 订阅/推送梯队完成）
-> 状态：已核实——ISSUE-01、02、03、04、05、06、07、08、09、10、11、13、15、17、18 已修复；其余未修复；修复顺序见下节
+> 更新：2026-11-01（T3 订阅/推送梯队完成；T4 快赢项 ISSUE-14/23/24/26 完成）
+> 状态：已核实——ISSUE-01、02、03、04、05、06、07、08、09、10、11、13、14、15、17、18、23、24、26 已修复；其余未修复；修复顺序见下节
 
 ## 优先级
 
@@ -29,7 +29,7 @@
 | ISSUE-11 | P1 | 客户端 | addListener 同步初始订阅可能阻塞（已修复：短超时有界同步，2026-11-01） | 服务端不可用时调用方卡住 |
 | ISSUE-12 | P1 | 核心 | 历史只存在内存、按条数截断 | 不能长期审计 |
 | ISSUE-13 | P1 | 接口 | HTTP 请求体无大小限制（已修复，2026-11-01） | 内存压力与 DoS 风险 |
-| ISSUE-14 | P1 | 接口 | list / history 无分页 | 大数据量响应过大 |
+| ISSUE-14 | P1 | 接口 | list / history 无分页（已修复，2026-11-01） | 大数据量响应过大 |
 | ISSUE-15 | P1 | 核心 | 无并发写冲突检测（已修复，2026-10-31） | 后写静默覆盖先写 |
 | ISSUE-16 | P1 | 运维 | 可观测性不足 | 故障定位困难 |
 | ISSUE-17 | P1 | 存储 | SegmentLog 全局同步，scan 阻塞写（已修复，2026-10-31） | 大日志扫描阻塞写入 |
@@ -38,10 +38,10 @@
 | ISSUE-20 | P2 | 安全 | 配置与客户端快照明文落盘 | 敏感配置泄露 |
 | ISSUE-21 | P2 | 审计 | 无身份与审计日志 | 变更无法追责 |
 | ISSUE-22 | P2 | 兼容 | 无协议/存储格式版本策略 | 升级兼容风险 |
-| ISSUE-23 | P2 | 易用性 | CLI 参数解析异常不友好 | 启动失败信息不明确 |
-| ISSUE-24 | P2 | 测试 | core 测试缺少 SLF4J 绑定 | 测试日志告警 |
+| ISSUE-23 | P2 | 易用性 | CLI 参数解析异常不友好（已修复，2026-11-01） | 启动失败信息不明确 |
+| ISSUE-24 | P2 | 测试 | core 测试缺少 SLF4J 绑定（已修复，2026-11-01） | 测试日志告警 |
 | ISSUE-25 | P2 | 控制台 | 无登录（分页、搜索已实现） | 控制台无访问控制 |
-| ISSUE-26 | P2 | 运维 | Windows 控制台中文日志乱码 | 日志可读性差 |
+| ISSUE-26 | P2 | 运维 | Windows 控制台中文日志乱码（已修复，2026-11-01） | 日志可读性差 |
 
 ## 修复顺序（2026-10-31 核实后，围绕单机核心链路）
 
@@ -54,7 +54,8 @@
 | T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（全部已修，2026-10-31） | T1 清零 |
 | T2 性能/可靠性 | 5→8 | ISSUE-07 → 17 → 06 → 18（全部已修，2026-10-31） | T2 清零；实施顺序按锁分离先于快照调整 |
 | T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13（全部已修，2026-11-01） | T3 清零；实施中 ISSUE-11 由全异步改为短超时有界同步，见条目说明 |
-| T4 外围 | — | 其余（12/14/16/19-26） | 非核心链路，暂缓 |
+| T4 快赢 | 14→23→24→26 | ISSUE-14 → 23 → 24 → 26（全部已修，2026-11-01） | 接口分页 + 三个小项，M0 收尾批次 |
+| T4 剩余 | — | 其余（12/16/19-22/25） | 非核心链路，暂缓；19-22/25 属 v1 之后 |
 
 ## 详细说明
 
@@ -246,14 +247,31 @@
   `ApiHandler` 增加带上限的构造器。测试见
   `CoreChainIntegrationTest.shouldRejectOversizedBodyWith413`、
   `ServerOptionsTest.shouldDefaultSubscriptionLimitAndBodyBytes`。
+  补充（2026-11-01）：拒绝前先**有界排空**客户端已发送的数据（预算
+  `max(16MB, maxBodyBytes*2)`）。带未读数据关连接会触发 TCP RST，把已发出的
+  413 响应一起冲掉，客户端只看到 Connection reset——原"不读流"实现下该集成测试
+  在部分环境必现失败；排空有预算，超大声明仍不会被读完，DoS 防护不变。
 
-### ISSUE-14 list / history 无分页
+### ISSUE-14 list / history 无分页（已修复，2026-11-01）
 
 - 位置：`ApiHandler.handleListConfigs`、`handleHistory`、`ConfigStateMachine.list`
 - 现状：一次返回 namespace/group 下全部配置或全部历史。
 - 风险：配置数量大时响应体大、序列化慢、控制台卡顿。
 - 建议：增加 `page`/`size` 或游标分页；history 已有 limit，补充偏移/游标。
 - 验证：大量配置下分页读取，响应大小稳定。
+- 修复：两接口统一返回分页信封 `{items, total, page, size}`（新增
+  `common/protocol/PageView`）。`list` 支持 `page`（默认 1）、`size`（默认 20，
+  上限 200）与可选 `keyword`（按 dataId 包含匹配、忽略大小写，与控制台原前端
+  过滤语义一致），排序为 modifiedTime 降序、dataId 升序兜底；`history` 支持
+  `page`/`size`（默认 20，上限 100），**移除旧 `limit` 参数**，取该 key 全量
+  保留历史（≤ historyLimit，天然有界）后切页，total 精确。页码越界返回空
+  items；`page < 1`、`size` 越界或非整数返回 400。分页在 ApiHandler 层切片，
+  不改 `StateMachine`/`ConfigProtocol` 接口；服务端仍全量物化单分组列表后再
+  切片，"配置数极大时的内存优化"留待后续（当前量级可控）。控制台同步迁移
+  服务端分页：搜索改防抖 250ms 服务端过滤，翻页改 `prevConfigPage`/
+  `nextConfigPage`，删除/过滤导致页码越界时自动回退最后一页，历史弹窗改用
+  `page=1&size=50`。测试见 `CoreChainIntegrationTest.shouldPageListAndHistory`，
+  既有 list/history 断言同步改为信封格式。
 
 ### ISSUE-15 无并发写冲突检测（已修复，2026-10-31）
 
@@ -334,21 +352,34 @@
 - 建议：定义协议版本协商、存储格式迁移和回滚方案；在启动时校验。
 - 验证：旧客户端连接新服务端的兼容矩阵测试。
 
-### ISSUE-23 CLI 参数解析异常不友好
+### ISSUE-23 CLI 参数解析异常不友好（已修复，2026-11-01）
 
 - 位置：`ServerOptions.fromArgs`
 - 现状：数字参数直接 `Integer.parseInt`，非法值抛 `NumberFormatException`，缺少参数名上下文。
 - 风险：启动失败信息不明确。
 - 建议：包装为 `PolyConfigException`，提示参数名和期望格式。
 - 验证：传入 `--http-port=abc` 得到清晰错误。
+- 修复：数值与路径解析统一走 `parseIntArg`/`parseLongArg`/`parsePathArg`，
+  `NumberFormatException`/`InvalidPathException` 包装为
+  `PolyConfigException(INVALID_ARGUMENT)`，错误信息带参数名与原始值
+  （如 `参数 --http-port 的值应为整数: abc`、`参数 --data-dir 不是合法路径: ...`）。
+  测试见 `ServerOptionsTest.shouldReportParameterNameWhenIntegerParseFails`、
+  `shouldReportParameterNameWhenLongParseFails`、
+  `shouldReportParameterNameWhenPathIsInvalid`。
 
-### ISSUE-24 core 测试缺少 SLF4J 绑定
+### ISSUE-24 core 测试缺少 SLF4J 绑定（已修复，2026-11-01）
 
 - 位置：`poly-config-core` 测试
 - 现状：有 `slf4j-api` 但没有测试期 binding，测试输出 NOP 警告。
 - 风险：仅影响测试日志，不影响功能。
 - 建议：给 core 加 test scope 的 logback，或父 POM 统一测试日志配置。
 - 验证：测试时不再出现 StaticLoggerBinder 警告。
+- 修复：2026-10-30 模块合并后 core 测试位于 `poly-config-server`，其
+  `logback-classic`（runtime scope 进测试类路径）即为测试期绑定，全量测试
+  无 StaticLoggerBinder/NOP 警告；补回归测试
+  `LoggingConfigTest.shouldHaveRealSlf4jBindingInTests` 断言
+  `LoggerFactory.getILoggerFactory()` 不是 `NOPLoggerFactory`，防止后续依赖
+  调整退化。
 
 ### ISSUE-25 控制台无分页、搜索、登录
 
@@ -359,10 +390,14 @@
 - 建议：随鉴权和分页一起做；先加分页和关键字过滤。
 - 验证：配置量大时控制台可翻页和搜索。
 
-### ISSUE-26 Windows 控制台中文日志乱码
+### ISSUE-26 Windows 控制台中文日志乱码（已修复，2026-11-01）
 
 - 位置：`logback.xml` 与 Windows 控制台编码
 - 现状：测试和运行日志里的中文在 GBK 终端显示为乱码。
 - 风险：日志可读性差，不影响功能。
 - 建议：logback 编码显式设置 UTF-8，并在文档中说明终端编码；或使用文件日志。
 - 验证：Windows 终端和 IDE 控制台中文正常。
+- 修复：logback ConsoleAppender encoder 显式 `<charset>UTF-8</charset>`，
+  输出不再依赖平台默认编码；中文在 IDEA 控制台与 UTF-8 环境直接可读，
+  Windows cmd/PowerShell 需先 `chcp 65001`。回归测试
+  `LoggingConfigTest.shouldForceUtf8ConsoleEncoding` 断言配置含 UTF-8 charset。

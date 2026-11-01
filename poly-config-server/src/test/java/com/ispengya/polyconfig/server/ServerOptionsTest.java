@@ -4,6 +4,7 @@ import com.ispengya.polyconfig.common.error.PolyConfigException;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -62,6 +63,41 @@ public class ServerOptionsTest {
             fail("0 请求体上限应被拒绝");
         } catch (PolyConfigException expected) {
             // 预期
+        }
+    }
+
+    @Test
+    public void shouldReportParameterNameWhenIntegerParseFails() {
+        try {
+            ServerOptions.fromArgs(new String[]{"--http-port=abc"});
+            fail("非法整数应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含参数名: " + expected.getMessage(),
+                    expected.getMessage().contains("http-port"));
+            assertTrue("错误信息应包含原始值: " + expected.getMessage(),
+                    expected.getMessage().contains("abc"));
+        }
+    }
+
+    @Test
+    public void shouldReportParameterNameWhenLongParseFails() {
+        try {
+            ServerOptions.fromArgs(new String[]{"--max-body-bytes=1.5MB"});
+            fail("非法长整数应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含参数名: " + expected.getMessage(),
+                    expected.getMessage().contains("max-body-bytes"));
+        }
+    }
+
+    @Test
+    public void shouldReportParameterNameWhenPathIsInvalid() {
+        try {
+            ServerOptions.fromArgs(new String[]{"--data-dir=a\u0000b"});
+            fail("非法路径应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含参数名: " + expected.getMessage(),
+                    expected.getMessage().contains("data-dir"));
         }
     }
 }

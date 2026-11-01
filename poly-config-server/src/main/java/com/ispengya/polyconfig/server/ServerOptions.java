@@ -3,6 +3,7 @@ package com.ispengya.polyconfig.server;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
@@ -129,13 +130,13 @@ public final class ServerOptions {
                     builder.advertiseHost(value);
                     break;
                 case "http-port":
-                    builder.httpPort(Integer.parseInt(value));
+                    builder.httpPort(parseIntArg(key, value));
                     break;
                 case "remoting-port":
-                    builder.remotingPort(Integer.parseInt(value));
+                    builder.remotingPort(parseIntArg(key, value));
                     break;
                 case "data-dir":
-                    builder.dataDir(Paths.get(value));
+                    builder.dataDir(parsePathArg(key, value));
                     break;
                 case "node-id":
                     builder.nodeId(value);
@@ -144,16 +145,16 @@ public final class ServerOptions {
                     builder.clusterId(value);
                     break;
                 case "history-limit":
-                    builder.historyLimit(Integer.parseInt(value));
+                    builder.historyLimit(parseIntArg(key, value));
                     break;
                 case "snapshot-threshold":
-                    builder.snapshotThreshold(Integer.parseInt(value));
+                    builder.snapshotThreshold(parseIntArg(key, value));
                     break;
                 case "max-subscriptions-per-connection":
-                    builder.maxSubscriptionsPerConnection(Integer.parseInt(value));
+                    builder.maxSubscriptionsPerConnection(parseIntArg(key, value));
                     break;
                 case "max-body-bytes":
-                    builder.maxBodyBytes(Long.parseLong(value));
+                    builder.maxBodyBytes(parseLongArg(key, value));
                     break;
                 case "mode":
                     builder.mode(value);
@@ -164,6 +165,54 @@ public final class ServerOptions {
             }
         }
         return builder.build();
+    }
+
+    /**
+     * 解析整数参数，失败时提示参数名与期望格式。
+     *
+     * @param key 参数名（不含 --）
+     * @param value 参数值
+     * @return 整数值
+     */
+    private static int parseIntArg(String key, String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                    "参数 --" + key + " 的值应为整数: " + value, e);
+        }
+    }
+
+    /**
+     * 解析长整型参数，失败时提示参数名与期望格式。
+     *
+     * @param key 参数名（不含 --）
+     * @param value 参数值
+     * @return 长整数值
+     */
+    private static long parseLongArg(String key, String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                    "参数 --" + key + " 的值应为整数: " + value, e);
+        }
+    }
+
+    /**
+     * 解析路径参数，失败时提示参数名与非法值。
+     *
+     * @param key 参数名（不含 --）
+     * @param value 参数值
+     * @return 路径
+     */
+    private static Path parsePathArg(String key, String value) {
+        try {
+            return Paths.get(value);
+        } catch (InvalidPathException e) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                    "参数 --" + key + " 不是合法路径: " + value, e);
+        }
     }
 
     public String getHost() {

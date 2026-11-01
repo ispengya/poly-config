@@ -33,5 +33,14 @@ public enum NodeRole {
     /**
      * AP 模式下某个分片的副本。
      */
-    REPLICA
+    REPLICA,
+
+    /**
+     * AP 模式下的对等节点。
+     *
+     * <p>全量副本模型下每个节点既是若干分区的 owner、也是其余分区的副本，
+     * 节点级角色无法用单一的 OWNER / REPLICA 描述，统一报告为 PEER；
+     * 分区级的 owner 归属见 {@code DistroAssignments}。</p>
+     */
+    PEER
 }

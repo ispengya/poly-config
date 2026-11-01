@@ -4,6 +4,8 @@ import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.util.NetworkUtils;
+import com.ispengya.polyconfig.consistency.ConfigProtocol;
+import com.ispengya.polyconfig.core.distro.DistroProtocol;
 import com.ispengya.polyconfig.core.service.ConfigService;
 import com.ispengya.polyconfig.server.http.ApiHandler;
 import com.ispengya.polyconfig.server.http.StaticFileHandler;
@@ -30,8 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * poly-config 服务端。
  *
- * <p>M0 只装配 standalone 协议；HTTP 管理面、客户端长连接和控制台静态资源
- * 都在同一个进程内。</p>
+ * <p>按 {@code --mode} 装配一致性协议：standalone 为 {@code LocalProtocol}，
+ * ap 为 {@code DistroProtocol}（M2），cp 留给 Raft（M1）。HTTP 管理面、
+ * 客户端长连接和控制台静态资源都在同一个进程内。</p>
  */
 public class PolyConfigServer {
 
@@ -43,9 +46,9 @@ public class PolyConfigServer {
     private final ServerOptions options;
 
     /**
-     * 单机协议。
+     * 一致性协议（standalone 为 LocalProtocol，ap 为 DistroProtocol）。
      */
-    private final LocalProtocol protocol;
+    private final ConfigProtocol protocol;
 
     /**
      * 配置服务。
@@ -102,14 +105,8 @@ public class PolyConfigServer {
         if (options == null) {
             throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "options 不能为空");
         }
-        if (!"standalone".equalsIgnoreCase(options.getMode())) {
-            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                    "M0 仅支持 standalone 模式，当前: " + options.getMode());
-        }
         this.options = options;
-        this.protocol = new LocalProtocol(options.getDataDir(), options.getNodeId(),
-                options.getClusterId(), options.getHistoryLimit(),
-                options.getSnapshotThreshold());
+        this.protocol = createProtocol(options);
         this.configService = new ConfigService(protocol);
         this.registry = new SubscriptionRegistry(options.getMaxSubscriptionsPerConnection());
         this.remotingServer = new NettyRemotingServer(options.getHost(), options.getRemotingPort());
@@ -121,7 +118,7 @@ public class PolyConfigServer {
                 daemonFactory("poly-config-remoting"));
 
         this.httpServer.createContext("/v1/",
-                new ApiHandler(configService, options.getMaxBodyBytes()));
+                new ApiHandler(configService, options.getMaxBodyBytes(), registry));
         this.httpServer.createContext("/", new StaticFileHandler());
         this.httpServer.setExecutor(httpExecutor);
 
@@ -136,6 +133,32 @@ public class PolyConfigServer {
 
         this.changePusher = new ChangePusher(remotingServer, registry);
         this.configService.addChangeListener(changePusher);
+    }
+
+    /**
+     * 按运行模式创建一致性协议。
+     *
+     * @param options 启动配置
+     * @return 一致性协议
+     */
+    private static ConfigProtocol createProtocol(ServerOptions options) {
+        String mode = options.getMode().trim().toLowerCase(java.util.Locale.ROOT);
+        switch (mode) {
+            case "standalone":
+                return new LocalProtocol(options.getDataDir(), options.getNodeId(),
+                        options.getClusterId(), options.getHistoryLimit(),
+                        options.getSnapshotThreshold());
+            case "ap":
+                return new DistroProtocol(options.getDataDir(), options.getNodeId(),
+                        options.getClusterId(), options.getHistoryLimit(),
+                        options.getSnapshotThreshold(), options.getClusterMembers());
+            case "cp":
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "CP 模式由 Raft 实现，尚未提供（M1 里程碑）");
+            default:
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "未知运行模式: " + options.getMode());
+        }
     }
 
     /**

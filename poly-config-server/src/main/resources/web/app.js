@@ -64,6 +64,10 @@ const app = createApp({
                 currentNodeId: '',
                 nodes: []
             },
+            subscriptions: {
+                total: 0,
+                connections: []
+            },
             editorVisible: false,
             editor: {
                 dataId: '',
@@ -255,6 +259,13 @@ const app = createApp({
             } catch (e) {
                 this.health = false;
                 throw e;
+            }
+            try {
+                // 订阅观测独立加载：失败不影响集群状态展示
+                this.subscriptions = await api('/v1/cs/subscriptions')
+                    || {total: 0, connections: []};
+            } catch (e) {
+                this.subscriptions = {total: 0, connections: []};
             }
         },
 

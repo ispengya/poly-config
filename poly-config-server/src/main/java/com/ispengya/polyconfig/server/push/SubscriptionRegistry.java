@@ -139,6 +139,54 @@ public class SubscriptionRegistry {
     }
 
     /**
+     * 返回订阅关系快照，用于管理面观测。
+     *
+     * <p>按连接列出远端地址与订阅键（键按字典序排序，连接按远端地址排序），
+     * 供 {@code GET /v1/cs/subscriptions} 与控制台展示。</p>
+     *
+     * @return 订阅快照
+     */
+    public synchronized SubscriptionSnapshot snapshot() {
+        List<SubscriptionSnapshot.Connection> connections = new ArrayList<>();
+        int total = 0;
+        for (Set<ConfigKey> keys : keysByChannel.values()) {
+            total += keys.size();
+        }
+        for (java.util.Map.Entry<Channel, Set<ConfigKey>> entry : keysByChannel.entrySet()) {
+            List<String> paths = new ArrayList<>();
+            for (ConfigKey key : entry.getValue()) {
+                paths.add(key.toPath());
+            }
+            Collections.sort(paths);
+            connections.add(new SubscriptionSnapshot.Connection(
+                    formatRemote(entry.getKey().remoteAddress()), paths));
+        }
+        Collections.sort(connections, java.util.Comparator.comparing(
+                SubscriptionSnapshot.Connection::getRemote));
+        return new SubscriptionSnapshot(total, connections);
+    }
+
+    /**
+     * 格式化远端地址为 {@code ip:port}。
+     *
+     * <p>不用 {@code InetSocketAddress.toString()}：其格式为 {@code 主机名/ip:端口}，
+     * 主机名解析不到时会留下一个斜杠开头的残缺展示。</p>
+     *
+     * @param address 远端地址，可为 {@code null}
+     * @return {@code ip:port}；非 inet 地址或为空时退化为 toString / 空串
+     */
+    private static String formatRemote(java.net.SocketAddress address) {
+        if (address instanceof java.net.InetSocketAddress) {
+            java.net.InetSocketAddress inet = (java.net.InetSocketAddress) address;
+            if (inet.getAddress() != null) {
+                return inet.getAddress().getHostAddress() + ":" + inet.getPort();
+            }
+            return inet.getHostString() + ":" + inet.getPort();
+        }
+        return address == null ? "" : address.toString();
+    }
+
+    /**
      * 返回全部订阅条目总数（key × connection），用于观测与上限校验。
      *
      * @return 订阅总数

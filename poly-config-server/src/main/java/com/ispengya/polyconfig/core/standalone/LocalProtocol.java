@@ -235,6 +235,7 @@ public class LocalProtocol implements ConfigProtocol {
      * @param httpPort HTTP 端口
      * @param remotingPort 客户端长连接端口
      */
+    @Override
     public void setNodeAddress(String host, int httpPort, int remotingPort) {
         this.host = host == null ? "" : host;
         this.httpPort = httpPort;

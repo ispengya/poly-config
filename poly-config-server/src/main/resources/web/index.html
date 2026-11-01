@@ -368,6 +368,40 @@
                         <button class="btn" @click="loadCluster">重试</button>
                     </div>
                 </div>
+
+                <div class="panel cluster-subscriptions">
+                    <div class="workbench-head" style="padding: 0 0 12px;">
+                        <div class="head-titles">
+                            <h2 class="workbench-title" style="font-size: 16px;">
+                                订阅者
+                                <span class="count">{{ (subscriptions.connections || []).length }} 个连接 ·
+                                    {{ subscriptions.total || 0 }} 个订阅</span>
+                            </h2>
+                            <div class="crumb">当前节点的本地订阅表，刷新后更新</div>
+                        </div>
+                    </div>
+                    <table v-if="(subscriptions.connections || []).length" class="sub-table">
+                        <thead>
+                        <tr>
+                            <th>客户端地址</th>
+                            <th>订阅数</th>
+                            <th>订阅键（namespace/group/dataId）</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <tr v-for="conn in subscriptions.connections" :key="conn.remote">
+                            <td class="mono">{{ conn.remote || '—' }}</td>
+                            <td>{{ conn.count }}</td>
+                            <td class="mono sub-keys">
+                                <span v-for="key in conn.keys" :key="key" class="sub-key">{{ key }}</span>
+                            </td>
+                        </tr>
+                        </tbody>
+                    </table>
+                    <div v-else class="empty" style="padding: 24px 0;">
+                        <p>当前节点暂无订阅连接。SDK 调用 addListener 后会出现在这里。</p>
+                    </div>
+                </div>
             </template>
         </main>
     </div>

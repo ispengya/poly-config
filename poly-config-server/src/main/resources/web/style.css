@@ -1948,3 +1948,44 @@ body {
         transition-duration: 0.001ms !important;
     }
 }
+
+/* ---------- 集群页订阅者面板 ---------- */
+
+.cluster-subscriptions {
+    margin-top: 16px;
+}
+
+.sub-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.sub-table th,
+.sub-table td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border, #e5e6eb);
+    vertical-align: top;
+}
+
+.sub-table th {
+    color: var(--text-2, #646a73);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.sub-keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.sub-key {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--bg-2, #f2f3f5);
+    color: var(--text-1, #1f2329);
+    font-size: 12px;
+}

@@ -14,6 +14,8 @@ import com.ispengya.polyconfig.common.protocol.PublishRequest;
 import com.ispengya.polyconfig.common.protocol.RollbackRequest;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.core.service.ConfigService;
+import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
+import com.ispengya.polyconfig.server.push.SubscriptionSnapshot;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import org.slf4j.Logger;
@@ -78,12 +80,17 @@ public class ApiHandler implements HttpHandler {
     private final long maxBodyBytes;
 
     /**
+     * 订阅注册表，用于订阅观测接口；为空时返回空快照。
+     */
+    private final SubscriptionRegistry registry;
+
+    /**
      * 创建 HTTP API 处理器（请求体上限取默认 1MB）。
      *
      * @param configService 配置服务
      */
     public ApiHandler(ConfigService configService) {
-        this(configService, DEFAULT_MAX_BODY_BYTES);
+        this(configService, DEFAULT_MAX_BODY_BYTES, null);
     }
 
     /**
@@ -93,8 +100,21 @@ public class ApiHandler implements HttpHandler {
      * @param maxBodyBytes 请求体最大字节数
      */
     public ApiHandler(ConfigService configService, long maxBodyBytes) {
+        this(configService, maxBodyBytes, null);
+    }
+
+    /**
+     * 创建 HTTP API 处理器。
+     *
+     * @param configService 配置服务
+     * @param maxBodyBytes 请求体最大字节数
+     * @param registry 订阅注册表，可为 {@code null}（订阅观测接口返回空快照）
+     */
+    public ApiHandler(ConfigService configService, long maxBodyBytes,
+                      SubscriptionRegistry registry) {
         this.configService = configService;
         this.maxBodyBytes = maxBodyBytes;
+        this.registry = registry;
     }
 
     @Override
@@ -109,6 +129,12 @@ public class ApiHandler implements HttpHandler {
             }
             if ("GET".equalsIgnoreCase(method) && "/v1/cs/cluster".equals(path)) {
                 writeJson(exchange, 200, ApiResponse.ok(configService.clusterStatus()));
+                return;
+            }
+            if ("GET".equalsIgnoreCase(method) && "/v1/cs/subscriptions".equals(path)) {
+                SubscriptionSnapshot snapshot = registry == null
+                        ? new SubscriptionSnapshot(0, null) : registry.snapshot();
+                writeJson(exchange, 200, ApiResponse.ok(snapshot));
                 return;
             }
             if ("GET".equalsIgnoreCase(method) && "/v1/cs/namespaces".equals(path)) {

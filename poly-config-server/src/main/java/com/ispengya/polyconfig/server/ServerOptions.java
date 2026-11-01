@@ -2,10 +2,13 @@ package com.ispengya.polyconfig.server;
 
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
+import com.ispengya.polyconfig.consistency.ClusterMember;
 
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.List;
+import java.util.Locale;
 
 /**
  * 服务端启动配置。
@@ -72,6 +75,11 @@ public final class ServerOptions {
      */
     private final String mode;
 
+    /**
+     * 静态集群成员列表；standalone 模式为空。
+     */
+    private final List<ClusterMember> clusterMembers;
+
     private ServerOptions(Builder builder) {
         this.host = builder.host;
         this.advertiseHost = builder.advertiseHost;
@@ -85,6 +93,7 @@ public final class ServerOptions {
         this.maxSubscriptionsPerConnection = builder.maxSubscriptionsPerConnection;
         this.maxBodyBytes = builder.maxBodyBytes;
         this.mode = builder.mode;
+        this.clusterMembers = ClusterMember.parseList(builder.clusterMembers);
     }
 
     /**
@@ -101,7 +110,8 @@ public final class ServerOptions {
      *
      * <p>支持 --host、--advertise-host、--http-port、--remoting-port、--data-dir、
      * --node-id、--cluster-id、--history-limit、--snapshot-threshold、
-     * --max-subscriptions-per-connection、--max-body-bytes、--mode。</p>
+     * --max-subscriptions-per-connection、--max-body-bytes、--mode、
+     * --cluster-members。</p>
      *
      * @param args 命令行参数
      * @return 启动配置
@@ -158,6 +168,9 @@ public final class ServerOptions {
                     break;
                 case "mode":
                     builder.mode(value);
+                    break;
+                case "cluster-members":
+                    builder.clusterMembers(value);
                     break;
                 default:
                     throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
@@ -264,6 +277,15 @@ public final class ServerOptions {
     }
 
     /**
+     * 返回静态集群成员列表；standalone 模式为空列表。
+     *
+     * @return 静态集群成员列表
+     */
+    public List<ClusterMember> getClusterMembers() {
+        return clusterMembers;
+    }
+
+    /**
      * 启动配置构造器。
      */
     public static final class Builder {
@@ -327,9 +349,14 @@ public final class ServerOptions {
         private long maxBodyBytes = 1024 * 1024L;
 
         /**
-         * 运行模式。
+         * 运行模式，可选 standalone / cp / ap。
          */
         private String mode = "standalone";
+
+        /**
+         * 静态集群成员列表原始串，格式 nodeId=host:httpPort:remotingPort，逗号分隔。
+         */
+        private String clusterMembers = "";
 
         public Builder host(String host) {
             this.host = host;
@@ -391,6 +418,11 @@ public final class ServerOptions {
             return this;
         }
 
+        public Builder clusterMembers(String clusterMembers) {
+            this.clusterMembers = clusterMembers;
+            return this;
+        }
+
         public ServerOptions build() {
             if (host == null || host.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "host 不能为空");
@@ -429,6 +461,33 @@ public final class ServerOptions {
             }
             if (mode == null || mode.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "mode 不能为空");
+            }
+            String normalizedMode = mode.trim().toLowerCase(Locale.ROOT);
+            if (!"standalone".equals(normalizedMode)
+                    && !"cp".equals(normalizedMode)
+                    && !"ap".equals(normalizedMode)) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "未知运行模式: " + mode + "（可选 standalone / cp / ap）");
+            }
+            List<ClusterMember> members = ClusterMember.parseList(clusterMembers);
+            if ("ap".equals(normalizedMode)) {
+                if (members.isEmpty()) {
+                    throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                            "AP 模式必须通过 --cluster-members 提供静态成员列表，"
+                                    + "格式 nodeId=host:httpPort:remotingPort，逗号分隔");
+                }
+                boolean selfIncluded = false;
+                for (ClusterMember member : members) {
+                    if (member.getNodeId().equals(nodeId)) {
+                        selfIncluded = true;
+                        break;
+                    }
+                }
+                if (!selfIncluded) {
+                    throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                            "AP 成员列表必须包含本节点 " + nodeId
+                                    + "=host:httpPort:remotingPort");
+                }
             }
             return new ServerOptions(this);
         }

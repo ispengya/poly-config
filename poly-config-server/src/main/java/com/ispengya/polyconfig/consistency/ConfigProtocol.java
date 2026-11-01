@@ -22,6 +22,17 @@ public interface ConfigProtocol extends AutoCloseable {
     void start();
 
     /**
+     * 更新节点对外地址。
+     *
+     * <p>在 HTTP / remoting 绑定完成后调用，供节点状态上报使用。</p>
+     *
+     * @param host 主机名或 IP
+     * @param httpPort HTTP 端口
+     * @param remotingPort 客户端长连接端口
+     */
+    void setNodeAddress(String host, int httpPort, int remotingPort);
+
+    /**
      * 提交一条配置命令。
      *
      * @param command 配置命令

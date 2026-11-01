@@ -536,6 +536,9 @@ public class CoreChainIntegrationTest {
         ServerOptions options = ServerOptions.builder()
                 .host("127.0.0.1")
                 .advertiseHost("127.0.0.1")
+                // 随机端口：默认端口可能被本机运行的演示集群占用
+                .httpPort(0)
+                .remotingPort(0)
                 .dataDir(dataDir)
                 .maxSubscriptionsPerConnection(2)
                 .build();

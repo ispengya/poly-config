@@ -80,4 +80,34 @@ public class SubscriptionRegistryTest {
         }
         assertEquals(100, registry.subscriptionCount());
     }
+
+    @Test
+    public void shouldSnapshotConnectionSubscriptions() {
+        SubscriptionRegistry registry = new SubscriptionRegistry();
+        EmbeddedChannel channelA = new EmbeddedChannel(new ChannelInboundHandlerAdapter());
+        EmbeddedChannel channelB = new EmbeddedChannel(new ChannelInboundHandlerAdapter());
+
+        assertTrue(registry.subscribe(channelA, KEY_B));
+        assertTrue(registry.subscribe(channelA, KEY_A));
+        assertTrue(registry.subscribe(channelB, KEY_A));
+
+        SubscriptionSnapshot snapshot = registry.snapshot();
+        assertEquals(3, snapshot.getTotal());
+        assertEquals(2, snapshot.getConnections().size());
+
+        SubscriptionSnapshot.Connection channelAView = null;
+        SubscriptionSnapshot.Connection channelBView = null;
+        for (SubscriptionSnapshot.Connection connection : snapshot.getConnections()) {
+            if (connection.getCount() == 2) {
+                channelAView = connection;
+            } else {
+                channelBView = connection;
+            }
+        }
+        // 键按字典序排序：a.yml 在前
+        assertEquals("public/G/a.yml", channelAView.getKeys().get(0));
+        assertEquals("public/G/b.yml", channelAView.getKeys().get(1));
+        assertEquals(1, channelBView.getCount());
+        assertEquals("public/G/a.yml", channelBView.getKeys().get(0));
+    }
 }

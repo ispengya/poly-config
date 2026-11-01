@@ -50,7 +50,9 @@ const app = createApp({
             namespaceFilter: '',
             groupFilter: '',
             configs: [],
+            configTotal: 0,
             search: '',
+            searchTimer: null,
             loading: false,
             refreshing: false,
             propagating: false,
@@ -103,26 +105,14 @@ const app = createApp({
         filteredGroups() {
             return filterNames(this.groups, this.groupFilter);
         },
-        filteredConfigs() {
-            const keyword = this.search.trim().toLowerCase();
-            if (!keyword) {
-                return this.configs;
-            }
-            return this.configs.filter(item =>
-                (item.dataId || '').toLowerCase().indexOf(keyword) >= 0);
-        },
-        pagedConfigs() {
-            const start = (this.configPage - 1) * PAGE_SIZE;
-            return this.filteredConfigs.slice(start, start + PAGE_SIZE);
-        },
         pageCount() {
-            return Math.max(1, Math.ceil(this.filteredConfigs.length / PAGE_SIZE));
+            return Math.max(1, Math.ceil(this.configTotal / PAGE_SIZE));
         },
         rangeStart() {
-            return this.filteredConfigs.length ? (this.configPage - 1) * PAGE_SIZE + 1 : 0;
+            return this.configTotal ? (this.configPage - 1) * PAGE_SIZE + 1 : 0;
         },
         rangeEnd() {
-            return Math.min(this.configPage * PAGE_SIZE, this.filteredConfigs.length);
+            return Math.min(this.configPage * PAGE_SIZE, this.configTotal);
         },
         healthyCount() {
             return (this.cluster.nodes || []).filter(node => node.healthy).length;
@@ -226,20 +216,30 @@ const app = createApp({
             if (!this.group) {
                 // 还没选分组：主区显示引导空态
                 this.configs = [];
+                this.configTotal = 0;
                 this.configPage = 1;
                 return;
             }
             this.loading = true;
             try {
-                const params = new URLSearchParams({
-                    namespace: this.namespace,
-                    group: this.group
-                });
-                const items = await api('/v1/cs/configs/list?' + params.toString());
-                const list = items || [];
-                list.sort((a, b) => (b.modifiedTime || 0) - (a.modifiedTime || 0));
-                this.configs = list;
-                this.configPage = 1;
+                // 服务端分页与过滤；删除导致当前页越界时回退到最后一页再取一次
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const params = new URLSearchParams({
+                        namespace: this.namespace,
+                        group: this.group,
+                        keyword: this.search.trim(),
+                        page: String(this.configPage),
+                        size: String(PAGE_SIZE)
+                    });
+                    const page = await api('/v1/cs/configs/list?' + params.toString());
+                    this.configs = (page && page.items) || [];
+                    this.configTotal = (page && page.total) || 0;
+                    const lastPage = Math.max(1, Math.ceil(this.configTotal / PAGE_SIZE));
+                    if (this.configPage <= lastPage) {
+                        break;
+                    }
+                    this.configPage = lastPage;
+                }
             } finally {
                 this.loading = false;
             }
@@ -379,10 +379,28 @@ const app = createApp({
         },
         onSearchInput() {
             this.configPage = 1;
+            window.clearTimeout(this.searchTimer);
+            this.searchTimer = window.setTimeout(() => {
+                this.loadConfigs().catch(e => this.$message.error(e.message));
+            }, 250);
         },
         clearSearch() {
+            window.clearTimeout(this.searchTimer);
             this.search = '';
             this.configPage = 1;
+            this.loadConfigs().catch(e => this.$message.error(e.message));
+        },
+        prevConfigPage() {
+            if (this.configPage > 1) {
+                this.configPage--;
+                this.loadConfigs().catch(e => this.$message.error(e.message));
+            }
+        },
+        nextConfigPage() {
+            if (this.configPage < this.pageCount) {
+                this.configPage++;
+                this.loadConfigs().catch(e => this.$message.error(e.message));
+            }
         },
 
         /* ---------- 编辑器 ---------- */
@@ -705,10 +723,11 @@ const app = createApp({
                     namespace: this.namespace,
                     group: this.historyGroup,
                     dataId: this.historyDataId,
-                    limit: '50'
+                    page: '1',
+                    size: '50'
                 });
-                const items = await api('/v1/cs/history?' + params.toString());
-                this.history = items || [];
+                const page = await api('/v1/cs/history?' + params.toString());
+                this.history = (page && page.items) || [];
             } catch (e) {
                 this.$message.error(e.message);
                 this.history = [];

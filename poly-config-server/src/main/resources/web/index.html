@@ -150,7 +150,7 @@
                     <div class="head-titles">
                         <h1 class="workbench-title">
                             配置
-                            <span class="count">{{ filteredConfigs.length }} 项</span>
+                            <span class="count">{{ configTotal }} 项</span>
                         </h1>
                         <div class="crumb">
                             <span>{{ namespace }}</span>
@@ -203,12 +203,12 @@
                                     @click="clearSearch">✕</button>
                         </div>
                         <span class="toolbar-note">
-                            显示 <strong>{{ filteredConfigs.length }}</strong> 项 ·
+                            共 <strong>{{ configTotal }}</strong> 项 ·
                             按最近修改排序
                         </span>
                     </div>
 
-                    <table class="ledger" v-if="filteredConfigs.length || loading">
+                    <table class="ledger" v-if="configs.length || loading">
                         <thead>
                         <tr>
                             <th class="col-rev">REV</th>
@@ -220,7 +220,7 @@
                         </tr>
                         </thead>
                         <tbody>
-                        <tr v-for="row in pagedConfigs" :key="row.dataId">
+                        <tr v-for="row in configs" :key="row.dataId">
                             <td class="col-rev">{{ row.revision }}</td>
                             <td class="col-id">
                                 <span class="dataid">{{ row.dataId }}</span>
@@ -246,7 +246,7 @@
                         </tbody>
                     </table>
 
-                    <div v-if="!filteredConfigs.length && !loading" class="empty">
+                    <div v-if="!configs.length && !loading" class="empty">
                         <svg class="empty-art" viewBox="0 0 96 84" fill="none" aria-hidden="true">
                             <path d="M28 12a4 4 0 0 1 4-4h22l16 16v44a4 4 0 0 1-4 4H32a4 4 0 0 1-4-4V12z"
                                   stroke="#b0b2b6" stroke-width="1.6" stroke-linejoin="round"/>
@@ -268,15 +268,15 @@
                         </template>
                     </div>
 
-                    <div v-if="filteredConfigs.length" class="pager">
+                    <div v-if="configTotal" class="pager">
                         <span>
                             <span class="mono">{{ rangeStart }}–{{ rangeEnd }}</span>
-                            / 共 {{ filteredConfigs.length }} 项
+                            / 共 {{ configTotal }} 项
                         </span>
                         <div class="pages">
-                            <button :disabled="configPage <= 1" @click="configPage--">‹</button>
+                            <button :disabled="configPage <= 1" @click="prevConfigPage">‹</button>
                             <span class="page-now mono">{{ configPage }} / {{ pageCount }}</span>
-                            <button :disabled="configPage >= pageCount" @click="configPage++">›</button>
+                            <button :disabled="configPage >= pageCount" @click="nextConfigPage">›</button>
                         </div>
                     </div>
                 </div>

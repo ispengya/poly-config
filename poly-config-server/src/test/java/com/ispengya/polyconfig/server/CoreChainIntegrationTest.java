@@ -82,8 +82,10 @@ public class CoreChainIntegrationTest {
             assertEquals(content, client.getConfig("DEFAULT_GROUP", "app.yml", 2000));
 
             Response history = get(server.getHttpPort(),
-                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&limit=10");
-            JSONArray historyData = JSON.parseObject(history.body).getJSONArray("data");
+                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&page=1&size=10");
+            JSONObject historyPage = JSON.parseObject(history.body).getJSONObject("data");
+            JSONArray historyData = historyPage.getJSONArray("items");
+            assertEquals(1, historyPage.getIntValue("total"));
             assertEquals(1, historyData.size());
             assertEquals("PUBLISH", historyData.getJSONObject(0).getString("operation"));
         } finally {
@@ -124,7 +126,9 @@ public class CoreChainIntegrationTest {
 
             Response list = get(server.getHttpPort(),
                     "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP");
-            JSONArray items = JSON.parseObject(list.body).getJSONArray("data");
+            JSONObject listPage = JSON.parseObject(list.body).getJSONObject("data");
+            JSONArray items = listPage.getJSONArray("items");
+            assertEquals(1, listPage.getIntValue("total"));
             assertEquals(1, items.size());
             assertEquals("v2", items.getJSONObject(0).getString("content"));
 
@@ -153,8 +157,9 @@ public class CoreChainIntegrationTest {
                     .getJSONArray("data").contains("PAYMENT"));
 
             Response history = get(server.getHttpPort(),
-                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&limit=10");
-            assertEquals(2, JSON.parseObject(history.body).getJSONArray("data").size());
+                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&page=1&size=10");
+            assertEquals(2, JSON.parseObject(history.body).getJSONObject("data")
+                    .getJSONArray("items").size());
 
             JSONObject rollback = new JSONObject();
             rollback.put("namespace", "public");
@@ -173,8 +178,79 @@ public class CoreChainIntegrationTest {
                     .getJSONObject("data").getString("content"));
 
             Response historyAfter = get(server.getHttpPort(),
-                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&limit=10");
-            assertEquals(3, JSON.parseObject(historyAfter.body).getJSONArray("data").size());
+                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=app.yml&page=1&size=10");
+            assertEquals(3, JSON.parseObject(historyAfter.body).getJSONObject("data")
+                    .getJSONArray("items").size());
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    public void shouldPageListAndHistory() throws Exception {
+        Path dataDir = folder.newFolder("paging-data").toPath();
+        PolyConfigServer server = startServer(dataDir);
+        try {
+            for (int i = 1; i <= 5; i++) {
+                assertEquals(200, post(server.getHttpPort(), "/v1/cs/configs",
+                        publishBody("app-" + i + ".yml", "v" + i, null)).status);
+            }
+
+            // 配置列表分页：total 恒为 5，页内条数受 size 约束
+            Response page1 = get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&page=1&size=2");
+            JSONObject data1 = JSON.parseObject(page1.body).getJSONObject("data");
+            assertEquals(5, data1.getIntValue("total"));
+            assertEquals(1, data1.getIntValue("page"));
+            assertEquals(2, data1.getIntValue("size"));
+            assertEquals(2, data1.getJSONArray("items").size());
+
+            Response page3 = get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&page=3&size=2");
+            JSONObject data3 = JSON.parseObject(page3.body).getJSONObject("data");
+            assertEquals(5, data3.getIntValue("total"));
+            assertEquals(1, data3.getJSONArray("items").size());
+
+            Response page9 = get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&page=9&size=2");
+            assertEquals(0, JSON.parseObject(page9.body).getJSONObject("data")
+                    .getJSONArray("items").size());
+
+            // 关键字过滤后分页
+            Response keyword = get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP"
+                            + "&keyword=app-1&page=1&size=10");
+            JSONObject keywordData = JSON.parseObject(keyword.body).getJSONObject("data");
+            assertEquals(1, keywordData.getIntValue("total"));
+            assertEquals("app-1.yml",
+                    keywordData.getJSONArray("items").getJSONObject(0).getString("dataId"));
+
+            // 非法分页参数返回 400
+            assertEquals(400, get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&page=0").status);
+            assertEquals(400, get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&size=9999").status);
+            assertEquals(400, get(server.getHttpPort(),
+                    "/v1/cs/configs/list?namespace=public&group=DEFAULT_GROUP&page=abc").status);
+
+            // 历史分页：同一 key 发布 3 次 → total 3，按新到旧切页
+            for (int i = 1; i <= 3; i++) {
+                assertEquals(200, post(server.getHttpPort(), "/v1/cs/configs",
+                        publishBody("hist.yml", "h" + i, null)).status);
+            }
+            Response hist1 = get(server.getHttpPort(),
+                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=hist.yml"
+                            + "&page=1&size=2");
+            JSONObject histData1 = JSON.parseObject(hist1.body).getJSONObject("data");
+            assertEquals(3, histData1.getIntValue("total"));
+            assertEquals(2, histData1.getJSONArray("items").size());
+            assertEquals("h3", histData1.getJSONArray("items")
+                    .getJSONObject(0).getString("content"));
+            Response hist2 = get(server.getHttpPort(),
+                    "/v1/cs/history?namespace=public&group=DEFAULT_GROUP&dataId=hist.yml"
+                            + "&page=2&size=2");
+            assertEquals(1, JSON.parseObject(hist2.body).getJSONObject("data")
+                    .getJSONArray("items").size());
         } finally {
             server.stop();
         }

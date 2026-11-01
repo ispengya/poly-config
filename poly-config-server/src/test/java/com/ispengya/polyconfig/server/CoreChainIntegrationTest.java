@@ -4,6 +4,7 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.ispengya.polyconfig.client.ClientOptions;
+import com.ispengya.polyconfig.client.ConfigListener;
 import com.ispengya.polyconfig.client.PolyConfigClient;
 import org.junit.Rule;
 import org.junit.Test;
@@ -24,6 +25,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -342,6 +344,156 @@ public class CoreChainIntegrationTest {
         } finally {
             second.stop();
         }
+    }
+
+    @Test
+    public void shouldStopPushAndClearRegistryAfterRemoveListener() throws Exception {
+        Path dataDir = folder.newFolder("unsubscribe-data").toPath();
+        Path snapshotDir = folder.newFolder("unsubscribe-snap").toPath();
+        PolyConfigServer server = startServer(dataDir);
+        PolyConfigClient client = null;
+        try {
+            client = new PolyConfigClient(clientOptions(server, snapshotDir));
+            List<String> received = new CopyOnWriteArrayList<>();
+            CountDownLatch firstPush = new CountDownLatch(1);
+            ConfigListener listener = (dataId, group, value) -> {
+                received.add(value);
+                firstPush.countDown();
+            };
+            client.addListener("DEFAULT_GROUP", "app.yml", listener);
+            assertEquals(200, post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJson("v1")).status);
+            assertTrue("未收到首次推送", firstPush.await(5, TimeUnit.SECONDS));
+            assertTrue("服务端应存在 1 条订阅", waitFor(
+                    () -> server.getSubscriptionCount() == 1, 3000L));
+
+            client.removeListener("DEFAULT_GROUP", "app.yml", listener);
+            assertTrue("取消订阅后服务端注册表应清空", waitFor(
+                    () -> server.getSubscriptionCount() == 0, 3000L));
+
+            assertEquals(200, post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJson("v2")).status);
+            Thread.sleep(1000L);
+            assertEquals("取消订阅后不应再收到推送", 1, received.size());
+            assertEquals("v1", received.get(0));
+        } finally {
+            if (client != null) {
+                client.close();
+            }
+            server.stop();
+        }
+    }
+
+    @Test
+    public void shouldResyncChangeAfterServerRestart() throws Exception {
+        Path dataDir = folder.newFolder("resync-data").toPath();
+        Path snapshotDir = folder.newFolder("resync-snap").toPath();
+        PolyConfigServer server1 = startServer(dataDir);
+        int httpPort = server1.getHttpPort();
+        int remotingPort = server1.getRemotingPort();
+        PolyConfigClient client = null;
+        try {
+            ClientOptions options = ClientOptions.builder()
+                    .server("127.0.0.1:" + remotingPort)
+                    .snapshotDir(snapshotDir)
+                    .requestTimeoutMillis(1000L)
+                    .resyncIntervalMillis(300L)
+                    .build();
+            client = new PolyConfigClient(options);
+            CountDownLatch firstPush = new CountDownLatch(1);
+            CountDownLatch resynced = new CountDownLatch(1);
+            List<String> received = new CopyOnWriteArrayList<>();
+            client.addListener("DEFAULT_GROUP", "app.yml", (dataId, group, value) -> {
+                received.add(value);
+                if ("v1".equals(value)) {
+                    firstPush.countDown();
+                }
+                if ("v2".equals(value)) {
+                    resynced.countDown();
+                }
+            });
+            assertEquals(200, post(httpPort, "/v1/cs/configs", publishJson("v1")).status);
+            assertTrue("未收到首次推送", firstPush.await(5, TimeUnit.SECONDS));
+
+            server1.stop();
+            // 同端口重启：订阅关系清空，推送不可能送达，新变更只能靠批量对账补发
+            PolyConfigServer server2 = startServer(dataDir, 0, httpPort, remotingPort);
+            try {
+                assertEquals(200, post(httpPort, "/v1/cs/configs",
+                        publishJson("v2")).status);
+                assertTrue("对账未补发变更", resynced.await(10, TimeUnit.SECONDS));
+                assertTrue(received.contains("v2"));
+            } finally {
+                server2.stop();
+            }
+        } finally {
+            if (client != null) {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    public void shouldRejectOversizedBodyWith413() throws Exception {
+        Path dataDir = folder.newFolder("body-limit-data").toPath();
+        PolyConfigServer server = startServer(dataDir);
+        try {
+            char[] padding = new char[2 * 1024 * 1024];
+            java.util.Arrays.fill(padding, 'x');
+            Response rejected = post(server.getHttpPort(), "/v1/cs/configs",
+                    publishBody("big.yml", "content: " + new String(padding), null));
+            assertEquals(413, rejected.status);
+            assertEquals(41301, JSON.parseObject(rejected.body).getIntValue("code"));
+
+            // 超限拒绝不影响正常发布
+            assertEquals(200, post(server.getHttpPort(), "/v1/cs/configs",
+                    publishJson("ok")).status);
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    public void shouldLimitSubscriptionsPerConnection() throws Exception {
+        Path dataDir = folder.newFolder("sublimit-data").toPath();
+        Path snapshotDir = folder.newFolder("sublimit-snap").toPath();
+        ServerOptions options = ServerOptions.builder()
+                .host("127.0.0.1")
+                .advertiseHost("127.0.0.1")
+                .dataDir(dataDir)
+                .maxSubscriptionsPerConnection(2)
+                .build();
+        PolyConfigServer server = new PolyConfigServer(options);
+        server.start();
+        PolyConfigClient client = null;
+        try {
+            client = new PolyConfigClient(clientOptions(server, snapshotDir));
+            // 同一连接注册 3 个 key，最多 2 个进注册表，超出的失败只告警不抛出
+            client.addListener("DEFAULT_GROUP", "a.yml", (dataId, group, value) -> { });
+            client.addListener("DEFAULT_GROUP", "b.yml", (dataId, group, value) -> { });
+            client.addListener("DEFAULT_GROUP", "c.yml", (dataId, group, value) -> { });
+            assertTrue("订阅数应被限制在上限内", waitFor(
+                    () -> server.getSubscriptionCount() == 2, 5000L));
+            Thread.sleep(500L);
+            assertEquals(2, server.getSubscriptionCount());
+        } finally {
+            if (client != null) {
+                client.close();
+            }
+            server.stop();
+        }
+    }
+
+    private static boolean waitFor(java.util.function.BooleanSupplier condition,
+                                   long timeoutMillis) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            Thread.sleep(50L);
+        }
+        return condition.getAsBoolean();
     }
 
     private static boolean waitForSnapshot(Path dir, long timeoutMillis) throws InterruptedException {

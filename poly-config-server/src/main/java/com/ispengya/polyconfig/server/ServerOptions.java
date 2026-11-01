@@ -57,6 +57,16 @@ public final class ServerOptions {
     private final int snapshotThreshold;
 
     /**
+     * 单连接最大订阅数，0 表示不限制。
+     */
+    private final int maxSubscriptionsPerConnection;
+
+    /**
+     * HTTP 请求体最大字节数。
+     */
+    private final long maxBodyBytes;
+
+    /**
      * 运行模式。
      */
     private final String mode;
@@ -71,6 +81,8 @@ public final class ServerOptions {
         this.clusterId = builder.clusterId;
         this.historyLimit = builder.historyLimit;
         this.snapshotThreshold = builder.snapshotThreshold;
+        this.maxSubscriptionsPerConnection = builder.maxSubscriptionsPerConnection;
+        this.maxBodyBytes = builder.maxBodyBytes;
         this.mode = builder.mode;
     }
 
@@ -87,7 +99,8 @@ public final class ServerOptions {
      * 从命令行参数解析配置。
      *
      * <p>支持 --host、--advertise-host、--http-port、--remoting-port、--data-dir、
-     * --node-id、--cluster-id、--history-limit、--mode 九项。</p>
+     * --node-id、--cluster-id、--history-limit、--snapshot-threshold、
+     * --max-subscriptions-per-connection、--max-body-bytes、--mode。</p>
      *
      * @param args 命令行参数
      * @return 启动配置
@@ -136,6 +149,12 @@ public final class ServerOptions {
                 case "snapshot-threshold":
                     builder.snapshotThreshold(Integer.parseInt(value));
                     break;
+                case "max-subscriptions-per-connection":
+                    builder.maxSubscriptionsPerConnection(Integer.parseInt(value));
+                    break;
+                case "max-body-bytes":
+                    builder.maxBodyBytes(Long.parseLong(value));
+                    break;
                 case "mode":
                     builder.mode(value);
                     break;
@@ -181,6 +200,14 @@ public final class ServerOptions {
 
     public int getSnapshotThreshold() {
         return snapshotThreshold;
+    }
+
+    public int getMaxSubscriptionsPerConnection() {
+        return maxSubscriptionsPerConnection;
+    }
+
+    public long getMaxBodyBytes() {
+        return maxBodyBytes;
     }
 
     public String getMode() {
@@ -241,6 +268,16 @@ public final class ServerOptions {
         private int snapshotThreshold = 10000;
 
         /**
+         * 单连接最大订阅数，0 表示不限制。
+         */
+        private int maxSubscriptionsPerConnection = 1024;
+
+        /**
+         * HTTP 请求体最大字节数，默认 1MB。
+         */
+        private long maxBodyBytes = 1024 * 1024L;
+
+        /**
          * 运行模式。
          */
         private String mode = "standalone";
@@ -290,6 +327,16 @@ public final class ServerOptions {
             return this;
         }
 
+        public Builder maxSubscriptionsPerConnection(int maxSubscriptionsPerConnection) {
+            this.maxSubscriptionsPerConnection = maxSubscriptionsPerConnection;
+            return this;
+        }
+
+        public Builder maxBodyBytes(long maxBodyBytes) {
+            this.maxBodyBytes = maxBodyBytes;
+            return this;
+        }
+
         public Builder mode(String mode) {
             this.mode = mode;
             return this;
@@ -322,6 +369,14 @@ public final class ServerOptions {
             if (snapshotThreshold < 0) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "snapshotThreshold 不能为负数");
+            }
+            if (maxSubscriptionsPerConnection < 0) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "maxSubscriptionsPerConnection 不能为负数");
+            }
+            if (maxBodyBytes <= 0) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "maxBodyBytes 必须大于 0");
             }
             if (mode == null || mode.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "mode 不能为空");

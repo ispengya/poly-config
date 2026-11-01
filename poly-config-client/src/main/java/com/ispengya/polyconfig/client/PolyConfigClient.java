@@ -3,10 +3,13 @@ package com.ispengya.polyconfig.client;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.model.ConfigKey;
+import com.ispengya.polyconfig.common.protocol.BatchSubscribeRequest;
+import com.ispengya.polyconfig.common.protocol.BatchSubscribeResponse;
 import com.ispengya.polyconfig.common.protocol.ConfigView;
 import com.ispengya.polyconfig.common.protocol.FetchRequest;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.protocol.PushEvent;
+import com.ispengya.polyconfig.common.protocol.SubscribeItem;
 import com.ispengya.polyconfig.common.protocol.SubscribeRequest;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.common.util.Md5Utils;
@@ -25,6 +28,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -117,6 +121,26 @@ public class PolyConfigClient implements ConfigService {
     private final AtomicBoolean closed = new AtomicBoolean();
 
     /**
+     * 单次批量对账的最大键数，与服务端上限对齐。
+     */
+    private static final int RESYNC_BATCH_SIZE = 512;
+
+    /**
+     * 初始订阅的短超时：连接被拒立即失败，黑洞场景阻塞上界。
+     */
+    private static final long INITIAL_SUBSCRIBE_TIMEOUT_MILLIS = 200L;
+
+    /**
+     * 连续对账失败次数，用于指数退避。
+     */
+    private final AtomicInteger consecutiveResyncFailures = new AtomicInteger();
+
+    /**
+     * 下次允许对账的时间点，退避期内直接跳过。
+     */
+    private volatile long nextResyncTimeMillis;
+
+    /**
      * 创建客户端并启动长连接。
      *
      * @param options 客户端配置
@@ -176,9 +200,24 @@ public class PolyConfigClient implements ConfigService {
         ConfigKey key = key(namespace, group, dataId);
         listeners.computeIfAbsent(key, value -> new CopyOnWriteArrayList<>())
                 .addIfAbsent(listener);
-        subscriptions.add(key);
+        if (!subscriptions.add(key)) {
+            // 已订阅过该 key，服务端订阅关系已存在，无需重复初始订阅
+            return;
+        }
+        // 先读本地快照，保证注册后立即可读
+        if (!contentCache.containsKey(key)) {
+            String snapshot = readSnapshot(key);
+            if (snapshot != null) {
+                contentCache.putIfAbsent(key, snapshot);
+                md5Cache.putIfAbsent(key, Md5Utils.md5Hex(snapshot));
+                log.debug("使用本地快照初始化缓存: {}", key);
+            }
+        }
+        // 初始订阅用短超时有界等待：服务端可用时注册返回即订阅生效（随后的变更推送不丢），
+        // 拒绝连接立即失败，网络黑洞最多阻塞 INITIAL_SUBSCRIBE_TIMEOUT_MILLIS；
+        // 失败不抛出，由定时对账补救
         try {
-            subscribe(key, false);
+            subscribe(key, false, INITIAL_SUBSCRIBE_TIMEOUT_MILLIS);
         } catch (PolyConfigException e) {
             log.warn("初始订阅失败，等待定时对账: {}", key, e);
         }
@@ -195,7 +234,35 @@ public class PolyConfigClient implements ConfigService {
         list.remove(listener);
         if (list.isEmpty()) {
             listeners.remove(key, list);
-            subscriptions.remove(key);
+            if (subscriptions.remove(key)) {
+                sendUnsubscribeAsync(key);
+            }
+        }
+    }
+
+    /**
+     * 异步通知服务端取消订阅，失败只记录日志——连接断开时服务端会自行清理。
+     *
+     * @param key 配置键
+     */
+    private void sendUnsubscribeAsync(ConfigKey key) {
+        try {
+            resyncScheduler.execute(() -> {
+                if (closed.get()) {
+                    return;
+                }
+                try {
+                    SubscribeRequest request = SubscribeRequest.of(key.getNamespace(),
+                            key.getGroup(), key.getDataId(), "", 0L);
+                    invokeWithFailover(ProtocolCodes.UNSUBSCRIBE,
+                            JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8),
+                            options.getRequestTimeoutMillis());
+                } catch (RuntimeException e) {
+                    log.debug("取消订阅失败(忽略): {}", key, e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            log.debug("客户端已关闭，忽略取消订阅: {}", key);
         }
     }
 
@@ -210,11 +277,29 @@ public class PolyConfigClient implements ConfigService {
     }
 
     private void subscribe(ConfigKey key, boolean notifyOnChange) {
+        subscribe(key, notifyOnChange, options.getRequestTimeoutMillis());
+    }
+
+    /**
+     * 执行单键订阅。
+     *
+     * @param key 配置键
+     * @param notifyOnChange 内容变化时是否通知监听器
+     * @param timeoutMillis 请求超时
+     */
+    private void subscribe(ConfigKey key, boolean notifyOnChange, long timeoutMillis) {
         SubscribeRequest request = SubscribeRequest.of(key.getNamespace(), key.getGroup(),
-                key.getDataId(), md5Cache.getOrDefault(key, ""));
+                key.getDataId(), md5Cache.getOrDefault(key, ""),
+                revisionCache.getOrDefault(key, 0L));
         RemotingCommand response = invokeWithFailover(ProtocolCodes.SUBSCRIBE,
-                JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8),
-                options.getRequestTimeoutMillis());
+                JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8), timeoutMillis);
+        if (response.getCode() == ProtocolCodes.RESPONSE_NOT_FOUND) {
+            // 本地持有内容但服务端已删除（首次订阅时服务端无此键仍返回 OK）
+            if (contentCache.containsKey(key)) {
+                applyDeletion(key, 0L);
+            }
+            return;
+        }
         if (response.getCode() != ProtocolCodes.RESPONSE_OK) {
             throw new PolyConfigException(ErrorCode.UNAVAILABLE,
                     "订阅失败: " + response.getRemark());
@@ -301,6 +386,11 @@ public class PolyConfigClient implements ConfigService {
 
     private void processPush(ConfigKey key, PushEvent event) {
         try {
+            // 已取消订阅的 key 不再处理推送
+            if (!subscriptions.contains(key)) {
+                log.debug("忽略已取消订阅的推送: {}", key);
+                return;
+            }
             if ("DELETE".equals(event.getOperation())) {
                 applyDeletion(key, event.getRevision());
                 return;
@@ -446,22 +536,104 @@ public class PolyConfigClient implements ConfigService {
         }
     }
 
+    /**
+     * 定时对账：按批携带每个键的 md5/revision 一次往返拉取差异。
+     *
+     * <p>整轮失败（所有服务端不可达）时短路退出并按连续失败次数指数退避，
+     * 避免服务端故障期间对每个键重复重试所有节点。</p>
+     */
     private void resyncSafely() {
         if (closed.get()) {
             return;
         }
-        for (ConfigKey key : subscriptions) {
-            if (closed.get()) {
-                return;
+        long now = System.currentTimeMillis();
+        if (now < nextResyncTimeMillis) {
+            log.debug("对账退避中，跳过本轮: 还剩 {}ms", nextResyncTimeMillis - now);
+            return;
+        }
+        List<ConfigKey> keys = new ArrayList<>(subscriptions);
+        if (keys.isEmpty()) {
+            return;
+        }
+        try {
+            for (int from = 0; from < keys.size(); from += RESYNC_BATCH_SIZE) {
+                if (closed.get()) {
+                    return;
+                }
+                List<SubscribeItem> targets = new ArrayList<>();
+                int to = Math.min(from + RESYNC_BATCH_SIZE, keys.size());
+                for (int i = from; i < to; i++) {
+                    ConfigKey key = keys.get(i);
+                    targets.add(SubscribeItem.of(key.getNamespace(), key.getGroup(),
+                            key.getDataId(), md5Cache.getOrDefault(key, ""),
+                            revisionCache.getOrDefault(key, 0L)));
+                }
+                resyncBatch(targets);
             }
-            try {
-                subscribe(key, true);
-            } catch (PolyConfigException e) {
-                log.debug("定时对账失败: {}", key, e);
-            } catch (RuntimeException e) {
-                log.warn("定时对账异常: {}", key, e);
+            consecutiveResyncFailures.set(0);
+            nextResyncTimeMillis = 0L;
+        } catch (PolyConfigException e) {
+            onResyncFailure(e);
+        } catch (RuntimeException e) {
+            log.warn("定时对账异常", e);
+            onResyncFailure(e);
+        }
+    }
+
+    /**
+     * 执行一批对账并应用差异。
+     *
+     * @param targets 订阅条目
+     */
+    private void resyncBatch(List<SubscribeItem> targets) {
+        BatchSubscribeRequest request = BatchSubscribeRequest.of(targets);
+        RemotingCommand response = invokeWithFailover(ProtocolCodes.BATCH_SUBSCRIBE,
+                JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8),
+                options.getRequestTimeoutMillis());
+        if (response.getCode() != ProtocolCodes.RESPONSE_OK) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "批量对账失败: " + response.getRemark());
+        }
+        if (response.getBody() == null || response.getBody().length == 0) {
+            return;
+        }
+        BatchSubscribeResponse diff = JsonUtils.parseObject(
+                new String(response.getBody(), StandardCharsets.UTF_8),
+                BatchSubscribeResponse.class);
+        if (diff == null) {
+            return;
+        }
+        if (diff.getChanged() != null) {
+            for (ConfigView view : diff.getChanged()) {
+                if (view == null || view.getDataId() == null) {
+                    continue;
+                }
+                applyView(view, true);
             }
         }
+        if (diff.getDeleted() != null) {
+            for (SubscribeItem item : diff.getDeleted()) {
+                if (item == null || item.getDataId() == null) {
+                    continue;
+                }
+                applyDeletion(new ConfigKey(item.getNamespace(), item.getGroup(),
+                        item.getDataId()), 0L);
+            }
+        }
+    }
+
+    /**
+     * 对账失败处理：短路本轮并指数退避（1/2/4/8 个对账周期封顶）。
+     *
+     * @param cause 失败原因
+     */
+    private void onResyncFailure(Exception cause) {
+        int failures = consecutiveResyncFailures.incrementAndGet();
+        long backoffMillis = options.getResyncIntervalMillis()
+                * (1L << Math.min(failures - 1, 3));
+        nextResyncTimeMillis = System.currentTimeMillis() + backoffMillis;
+        log.warn("定时对账失败，连续第 {} 次，退避 {}ms: {}",
+                failures, backoffMillis, cause.getMessage());
     }
 
     private ConfigKey key(String namespace, String group, String dataId) {

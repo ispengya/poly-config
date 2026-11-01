@@ -8,6 +8,7 @@ package com.ispengya.polyconfig.common.error;
 public enum ErrorCode {
 
     INVALID_ARGUMENT(40001, "参数不合法"),
+    PAYLOAD_TOO_LARGE(41301, "请求体过大"),
     NOT_FOUND(40401, "配置不存在"),
     VERSION_CONFLICT(40901, "配置版本冲突"),
     STORAGE_ERROR(50001, "存储错误"),

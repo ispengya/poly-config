@@ -9,8 +9,10 @@ import com.ispengya.polyconfig.server.http.ApiHandler;
 import com.ispengya.polyconfig.server.http.StaticFileHandler;
 import com.ispengya.polyconfig.server.push.ChangePusher;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
+import com.ispengya.polyconfig.server.remoting.BatchSubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
+import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
 import com.ispengya.polyconfig.core.standalone.LocalProtocol;
 import com.ispengya.remoting.netty.NettyRemotingServer;
 import com.sun.net.httpserver.HttpServer;
@@ -109,7 +111,7 @@ public class PolyConfigServer {
                 options.getClusterId(), options.getHistoryLimit(),
                 options.getSnapshotThreshold());
         this.configService = new ConfigService(protocol);
-        this.registry = new SubscriptionRegistry();
+        this.registry = new SubscriptionRegistry(options.getMaxSubscriptionsPerConnection());
         this.remotingServer = new NettyRemotingServer(options.getHost(), options.getRemotingPort());
         this.httpServer = HttpServer.create(
                 new InetSocketAddress(options.getHost(), options.getHttpPort()), 0);
@@ -118,12 +120,17 @@ public class PolyConfigServer {
         this.remotingExecutor = Executors.newCachedThreadPool(
                 daemonFactory("poly-config-remoting"));
 
-        this.httpServer.createContext("/v1/", new ApiHandler(configService));
+        this.httpServer.createContext("/v1/",
+                new ApiHandler(configService, options.getMaxBodyBytes()));
         this.httpServer.createContext("/", new StaticFileHandler());
         this.httpServer.setExecutor(httpExecutor);
 
         this.remotingServer.registerProcessor(ProtocolCodes.SUBSCRIBE,
                 new SubscribeProcessor(configService, registry), remotingExecutor);
+        this.remotingServer.registerProcessor(ProtocolCodes.UNSUBSCRIBE,
+                new UnsubscribeProcessor(registry), remotingExecutor);
+        this.remotingServer.registerProcessor(ProtocolCodes.BATCH_SUBSCRIBE,
+                new BatchSubscribeProcessor(configService), remotingExecutor);
         this.remotingServer.registerProcessor(ProtocolCodes.FETCH,
                 new FetchProcessor(configService), remotingExecutor);
 
@@ -214,6 +221,15 @@ public class PolyConfigServer {
      */
     public int getRemotingPort() {
         return remotingServer.localListenPort();
+    }
+
+    /**
+     * 返回当前订阅条目总数（key × connection），用于观测。
+     *
+     * @return 订阅总数
+     */
+    public int getSubscriptionCount() {
+        return registry.subscriptionCount();
     }
 
     private String resolveAdvertisedHost() {

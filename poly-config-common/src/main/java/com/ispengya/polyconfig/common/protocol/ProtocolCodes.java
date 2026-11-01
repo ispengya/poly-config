@@ -16,6 +16,16 @@ public final class ProtocolCodes {
     public static final int FETCH = 1002;
 
     /**
+     * 取消订阅配置变更。
+     */
+    public static final int UNSUBSCRIBE = 1003;
+
+    /**
+     * 批量订阅/对账。
+     */
+    public static final int BATCH_SUBSCRIBE = 1004;
+
+    /**
      * 服务端推送配置变更。
      */
     public static final int PUSH_CONFIG_CHANGED = 2001;

@@ -117,6 +117,29 @@ public class PolyConfigClientTest {
     }
 
     @Test
+    public void shouldRegisterListenerWithoutBlockingWhenServerUnavailable() throws Exception {
+        ClientOptions options = ClientOptions.builder()
+                .server("127.0.0.1:1")
+                .snapshotDir(folder.newFolder("offline-snapshots").toPath())
+                .requestTimeoutMillis(3000L)
+                .resyncIntervalMillis(60000L)
+                .build();
+        PolyConfigClient offline = new PolyConfigClient(options);
+        try {
+            ConfigListener listener = (dataId, group, content) -> { };
+            long start = System.currentTimeMillis();
+            offline.addListener("public", "DEFAULT_GROUP", "offline.yml", listener);
+            long elapsed = System.currentTimeMillis() - start;
+            assertTrue("addListener 不应同步等待初始订阅, 耗时=" + elapsed + "ms",
+                    elapsed < 1000);
+            // 移除监听时的取消订阅同样是异步的，不抛异常
+            offline.removeListener("public", "DEFAULT_GROUP", "offline.yml", listener);
+        } finally {
+            offline.close();
+        }
+    }
+
+    @Test
     public void shouldApplyDeletionWithoutRevision() throws Exception {
         CountDownLatch deleted = new CountDownLatch(1);
         client.addListener("public", "DEFAULT_GROUP", "app.yml",

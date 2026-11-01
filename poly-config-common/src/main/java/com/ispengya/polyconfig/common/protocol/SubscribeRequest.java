@@ -25,6 +25,11 @@ public class SubscribeRequest {
      */
     private String md5;
 
+    /**
+     * 客户端当前持有的条目 revision，首次订阅或未知时为 0。
+     */
+    private long revision;
+
     public SubscribeRequest() {
     }
 
@@ -35,15 +40,26 @@ public class SubscribeRequest {
      * @param group 分组
      * @param dataId 配置项 ID
      * @param md5 客户端当前 MD5
+     * @param revision 客户端当前 revision，未知时传 0
      * @return 订阅请求
      */
-    public static SubscribeRequest of(String namespace, String group, String dataId, String md5) {
+    public static SubscribeRequest of(String namespace, String group, String dataId,
+                                      String md5, long revision) {
         SubscribeRequest request = new SubscribeRequest();
         request.namespace = namespace;
         request.group = group;
         request.dataId = dataId;
         request.md5 = md5;
+        request.revision = revision;
         return request;
+    }
+
+    public long getRevision() {
+        return revision;
+    }
+
+    public void setRevision(long revision) {
+        this.revision = revision;
     }
 
     public String getNamespace() {

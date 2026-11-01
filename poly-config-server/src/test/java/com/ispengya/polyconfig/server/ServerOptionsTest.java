@@ -32,4 +32,36 @@ public class ServerOptionsTest {
             // 预期
         }
     }
+
+    @Test
+    public void shouldDefaultSubscriptionLimitAndBodyBytes() {
+        ServerOptions options = ServerOptions.builder().build();
+        assertEquals(1024, options.getMaxSubscriptionsPerConnection());
+        assertEquals(1024 * 1024L, options.getMaxBodyBytes());
+    }
+
+    @Test
+    public void shouldParseSubscriptionLimitAndBodyBytesFromArgs() {
+        ServerOptions options = ServerOptions.fromArgs(new String[]{
+                "--max-subscriptions-per-connection=64",
+                "--max-body-bytes=4096"});
+        assertEquals(64, options.getMaxSubscriptionsPerConnection());
+        assertEquals(4096L, options.getMaxBodyBytes());
+    }
+
+    @Test
+    public void shouldRejectInvalidSubscriptionLimitAndBodyBytes() {
+        try {
+            ServerOptions.builder().maxSubscriptionsPerConnection(-1).build();
+            fail("负数订阅上限应被拒绝");
+        } catch (PolyConfigException expected) {
+            // 预期
+        }
+        try {
+            ServerOptions.builder().maxBodyBytes(0).build();
+            fail("0 请求体上限应被拒绝");
+        } catch (PolyConfigException expected) {
+            // 预期
+        }
+    }
 }

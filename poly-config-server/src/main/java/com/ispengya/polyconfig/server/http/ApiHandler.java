@@ -39,17 +39,38 @@ public class ApiHandler implements HttpHandler {
     private static final Logger log = LoggerFactory.getLogger(ApiHandler.class);
 
     /**
+     * 默认请求体上限：1MB。
+     */
+    public static final long DEFAULT_MAX_BODY_BYTES = 1024 * 1024L;
+
+    /**
      * 配置服务。
      */
     private final ConfigService configService;
 
     /**
-     * 创建 HTTP API 处理器。
+     * 请求体最大字节数，超限返回 413。
+     */
+    private final long maxBodyBytes;
+
+    /**
+     * 创建 HTTP API 处理器（请求体上限取默认 1MB）。
      *
      * @param configService 配置服务
      */
     public ApiHandler(ConfigService configService) {
+        this(configService, DEFAULT_MAX_BODY_BYTES);
+    }
+
+    /**
+     * 创建 HTTP API 处理器。
+     *
+     * @param configService 配置服务
+     * @param maxBodyBytes 请求体最大字节数
+     */
+    public ApiHandler(ConfigService configService, long maxBodyBytes) {
         this.configService = configService;
+        this.maxBodyBytes = maxBodyBytes;
     }
 
     @Override
@@ -204,12 +225,37 @@ public class ApiHandler implements HttpHandler {
                 request.getRevision(), request.getOperator())));
     }
 
-    private static String readBody(HttpExchange exchange) throws IOException {
+    /**
+     * 读取请求体，超过 {@link #maxBodyBytes} 直接拒绝。
+     *
+     * @param exchange HTTP 交换
+     * @return 请求体字符串
+     * @throws IOException 读取失败
+     */
+    private String readBody(HttpExchange exchange) throws IOException {
+        String declaredLength = exchange.getRequestHeaders().getFirst("Content-Length");
+        if (declaredLength != null) {
+            try {
+                if (Long.parseLong(declaredLength) > maxBodyBytes) {
+                    throw new PolyConfigException(ErrorCode.PAYLOAD_TOO_LARGE,
+                            "请求体超过上限: " + maxBodyBytes + " 字节");
+                }
+            } catch (NumberFormatException e) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "Content-Length 格式错误: " + declaredLength);
+            }
+        }
         ByteArrayOutputStream result = new ByteArrayOutputStream();
         byte[] buffer = new byte[4096];
         int read;
+        long total = 0;
         try (InputStream input = exchange.getRequestBody()) {
             while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > maxBodyBytes) {
+                    throw new PolyConfigException(ErrorCode.PAYLOAD_TOO_LARGE,
+                            "请求体超过上限: " + maxBodyBytes + " 字节");
+                }
                 result.write(buffer, 0, read);
             }
         }
@@ -261,6 +307,8 @@ public class ApiHandler implements HttpHandler {
         switch (errorCode) {
             case INVALID_ARGUMENT:
                 return 400;
+            case PAYLOAD_TOO_LARGE:
+                return 413;
             case NOT_FOUND:
                 return 404;
             case VERSION_CONFLICT:

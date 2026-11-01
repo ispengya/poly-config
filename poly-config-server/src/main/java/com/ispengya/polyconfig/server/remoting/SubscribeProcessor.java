@@ -57,20 +57,33 @@ public class SubscribeProcessor implements NettyRequestProcessor {
                     new String(request.getBody(), StandardCharsets.UTF_8), SubscribeRequest.class);
             ConfigKey key = new ConfigKey(subscribe.getNamespace(), subscribe.getGroup(),
                     subscribe.getDataId());
-            registry.subscribe(ctx.channel(), key);
+            // 单连接订阅数上限
+            if (!registry.subscribe(ctx.channel(), key)) {
+                return RemotingCommand.createResponseCommand(
+                        ProtocolCodes.RESPONSE_BAD_REQUEST,
+                        "订阅数超出单连接上限: " + key);
+            }
 
-            RemotingCommand response = RemotingCommand.createResponseCommand(
-                    ProtocolCodes.RESPONSE_OK, "ok");
             Optional<ConfigEntry> entry = configService.get(key.getNamespace(),
                     key.getGroup(), key.getDataId());
-            if (entry.isPresent()) {
-                String requestedMd5 = subscribe.getMd5();
-                if (requestedMd5 == null || requestedMd5.isEmpty()
-                        || !requestedMd5.equals(entry.get().getMd5())) {
-                    response.setBody(JsonUtils.toJson(ConfigView.from(entry.get()))
-                            .getBytes(StandardCharsets.UTF_8));
+            if (!entry.isPresent()) {
+                // 客户端声明持有版本（revision>0 或 md5 非空）但服务端已无此键，说明已删除；
+                // 首次订阅（两者皆空）不存在可删内容，按"暂无配置"成功返回
+                if (subscribe.getRevision() > 0
+                        || (subscribe.getMd5() != null && !subscribe.getMd5().isEmpty())) {
+                    return RemotingCommand.createResponseCommand(
+                            ProtocolCodes.RESPONSE_NOT_FOUND, "配置不存在");
                 }
+                return RemotingCommand.createResponseCommand(
+                        ProtocolCodes.RESPONSE_OK, "ok");
             }
+            RemotingCommand response = RemotingCommand.createResponseCommand(
+                    ProtocolCodes.RESPONSE_OK, "ok");
+            if (isUnchanged(subscribe.getRevision(), subscribe.getMd5(), entry.get())) {
+                return response;
+            }
+            response.setBody(JsonUtils.toJson(ConfigView.from(entry.get()))
+                    .getBytes(StandardCharsets.UTF_8));
             return response;
         } catch (PolyConfigException e) {
             return RemotingCommand.createResponseCommand(
@@ -80,5 +93,21 @@ public class SubscribeProcessor implements NettyRequestProcessor {
             return RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_SERVER_ERROR, "订阅处理失败");
         }
+    }
+
+    /**
+     * 判断客户端声明的版本与服务端当前条目一致。
+     *
+     * @param clientRevision 客户端持有的 revision，0 表示未知
+     * @param clientMd5 客户端持有的 MD5，空表示未知
+     * @param entry 服务端当前条目
+     * @return 内容未变更返回 {@code true}
+     */
+    static boolean isUnchanged(long clientRevision, String clientMd5, ConfigEntry entry) {
+        if (clientRevision > 0 && clientRevision == entry.getRevision()) {
+            return true;
+        }
+        return clientMd5 != null && !clientMd5.isEmpty()
+                && clientMd5.equals(entry.getMd5());
     }
 }

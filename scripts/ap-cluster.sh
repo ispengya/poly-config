@@ -50,7 +50,20 @@ kill_node() {
     kill "$1" >/dev/null 2>&1 || kill -9 "$1" >/dev/null 2>&1 || true
 }
 
+check_env() {
+    if ! command -v java >/dev/null 2>&1 || ! command -v mvn >/dev/null 2>&1; then
+        echo "[env] 未找到 java/mvn。" >&2
+        echo "      - Git Bash: 确认 JDK/Maven 已在 Windows PATH 中" >&2
+        echo "      - WSL:      需要 Linux 工具链（sudo apt install openjdk-17-jdk maven），" >&2
+        echo "                  并把 MAVEN_OPTS 配到 Windows 仓库:" >&2
+        echo "                  export MAVEN_OPTS=\"-Dmaven.repo.local=/mnt/c/Users/你的用户名/.m2/repository\"" >&2
+        echo "      最省事的做法是回到 Git Bash 运行本脚本" >&2
+        exit 1
+    fi
+}
+
 build() {
+    check_env
     echo "[build] 增量编译 + 生成运行 classpath ..."
     mvn -q -pl poly-config-server -am compile
     mvn -q -pl poly-config-client -am test-compile

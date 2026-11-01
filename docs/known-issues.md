@@ -1,8 +1,8 @@
 # poly-config 已知问题清单
 
 > 范围：M0 单机核心链路
-> 更新：2026-10-31（逐项对照代码核实）
-> 状态：已核实——ISSUE-01、02、03、04、05、06、07、15、17、18 已修复；其余未修复；修复顺序见下节
+> 更新：2026-11-01（T3 订阅/推送梯队完成）
+> 状态：已核实——ISSUE-01、02、03、04、05、06、07、08、09、10、11、13、15、17、18 已修复；其余未修复；修复顺序见下节
 
 ## 优先级
 
@@ -23,12 +23,12 @@
 | ISSUE-05 | P0 | 安全 | 默认监听 0.0.0.0 且无鉴权（已修复：默认回环，2026-10-31） | 局域网内可读写 |
 | ISSUE-06 | P1 | 存储 | 无快照与日志前缀压缩（已修复，2026-10-31） | 日志无限增长、重启变慢 |
 | ISSUE-07 | P1 | 性能 | 每条命令 fsync，无 group commit（已修复，2026-10-31） | 写吞吐受磁盘延迟限制 |
-| ISSUE-08 | P1 | 推送 | 无 UNSUBSCRIBE，移除监听后仍推送 | 无效推送与资源浪费 |
-| ISSUE-09 | P1 | 推送 | 单连接订阅数无上限 | 推送遍历与内存膨胀 |
-| ISSUE-10 | P1 | 客户端 | 定时对账逐 key 同步请求 | 订阅多时对账很慢 |
-| ISSUE-11 | P1 | 客户端 | addListener 同步初始订阅可能阻塞 | 服务端不可用时调用方卡住 |
+| ISSUE-08 | P1 | 推送 | 无 UNSUBSCRIBE，移除监听后仍推送（已修复，2026-11-01） | 无效推送与资源浪费 |
+| ISSUE-09 | P1 | 推送 | 单连接订阅数无上限（已修复，2026-11-01） | 推送遍历与内存膨胀 |
+| ISSUE-10 | P1 | 客户端 | 定时对账逐 key 同步请求（已修复，2026-11-01） | 订阅多时对账很慢 |
+| ISSUE-11 | P1 | 客户端 | addListener 同步初始订阅可能阻塞（已修复：短超时有界同步，2026-11-01） | 服务端不可用时调用方卡住 |
 | ISSUE-12 | P1 | 核心 | 历史只存在内存、按条数截断 | 不能长期审计 |
-| ISSUE-13 | P1 | 接口 | HTTP 请求体无大小限制 | 内存压力与 DoS 风险 |
+| ISSUE-13 | P1 | 接口 | HTTP 请求体无大小限制（已修复，2026-11-01） | 内存压力与 DoS 风险 |
 | ISSUE-14 | P1 | 接口 | list / history 无分页 | 大数据量响应过大 |
 | ISSUE-15 | P1 | 核心 | 无并发写冲突检测（已修复，2026-10-31） | 后写静默覆盖先写 |
 | ISSUE-16 | P1 | 运维 | 可观测性不足 | 故障定位困难 |
@@ -46,14 +46,14 @@
 ## 修复顺序（2026-10-31 核实后，围绕单机核心链路）
 
 > 单机核心链路 = 写入（客户端 → HTTP/remoting → propose → SegmentLog）+ 订阅/推送 + 重启恢复。
-> 核实结论：ISSUE-01、02、03、04、05、06、07、15、17、18 已修复且有测试覆盖；其余 16 项未修复
-> （其中 ISSUE-11、25 有部分进展，已并入对应条目）。
+> 核实结论：ISSUE-01、02、03、04、05、06、07、08、09、10、11、13、15、17、18 已修复且有测试覆盖；
+> 其余 11 项未修复（其中 ISSUE-25 有部分进展，已并入对应条目）。
 
 | 梯队 | 顺序 | 条目 | 理由 |
 |---|---|---|---|
 | T1 正确性/安全 | 1→4 | ISSUE-02 → 05 → 03 → 15（全部已修，2026-10-31） | T1 清零 |
 | T2 性能/可靠性 | 5→8 | ISSUE-07 → 17 → 06 → 18（全部已修，2026-10-31） | T2 清零；实施顺序按锁分离先于快照调整 |
-| T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13 | ISSUE-13 体量小，可顺手提前 |
+| T3 订阅/推送 | 9→13 | ISSUE-10 → 08 → 11 → 09 → 13（全部已修，2026-11-01） | T3 清零；实施中 ISSUE-11 由全异步改为短超时有界同步，见条目说明 |
 | T4 外围 | — | 其余（12/14/16/19-26） | 非核心链路，暂缓 |
 
 ## 详细说明
@@ -154,31 +154,60 @@
   重启由恢复流程兜底）。测试见
   `CoreChainIntegrationTest.shouldCompleteConcurrentPublishesWithDistinctRevisions`。
 
-### ISSUE-08 无 UNSUBSCRIBE，移除监听后仍推送
+### ISSUE-08 无 UNSUBSCRIBE，移除监听后仍推送（已修复，2026-11-01）
 
 - 位置：`SubscriptionRegistry`、`ChangePusher`、`PolyConfigClient.removeListener`
 - 现状：客户端移除最后一个监听器后只清理本地状态，服务端仍然保留订阅并继续推送；客户端收到推送后还会拉取内容。
 - 风险：无效网络流量、服务端订阅表膨胀、客户端缓存做无意义更新。
 - 建议：增加 `UNSUBSCRIBE` 协议码，服务端精确移除 channel→key；客户端在没有监听器时发送。
 - 验证：订阅后移除监听，触发变更，确认服务端不再推送。
+- 修复：新增协议码 `UNSUBSCRIBE`（1003）与 `UnsubscribeProcessor`；`SubscriptionRegistry`
+  增加 `unsubscribe(channel, key)` 单键精确移除（与全量 `remove` 并存）。客户端
+  `removeListener` 在最后一个监听器移除时异步发送取消订阅（失败仅 debug 日志，连接断开时
+  服务端本就会清理）；`processPush` 增加 `subscriptions.contains(key)` 守卫，取消订阅后的
+  在途推送直接丢弃、不再触发拉取。测试见 `SubscriptionRegistryTest.shouldUnsubscribeSingleKey`、
+  `SubscribeProcessorsTest.shouldUnsubscribeViaProcessor`、
+  `CoreChainIntegrationTest.shouldStopPushAndClearRegistryAfterRemoveListener`。
 
-### ISSUE-09 单连接订阅数无上限
+### ISSUE-09 单连接订阅数无上限（已修复，2026-11-01）
 
 - 位置：`SubscriptionRegistry.subscribe`
 - 现状：任意连接可以无限添加订阅键。
 - 风险：错误客户端或恶意客户端造成服务端内存增长，变更时遍历大量订阅。
 - 建议：配置每连接最大订阅数，超出返回错误；记录订阅总数指标。
 - 验证：超过上限订阅时收到明确错误，服务端内存稳定。
+- 修复：`SubscriptionRegistry` 构造参数 `maxSubscriptionsPerConnection`（默认 1024，
+  0 表示不限制），`subscribe` 超限返回 `false`，处理器回 `RESPONSE_BAD_REQUEST` 并带
+  明确提示；重复订阅已有键不占新额度。新增 `subscriptionCount()` 与
+  `PolyConfigServer.getSubscriptionCount()` 暴露订阅总数。启动参数
+  `--max-subscriptions-per-connection`（须 ≥ 0）。测试见
+  `SubscriptionRegistryTest.shouldRejectWhenSubscriptionLimitExceeded`、
+  `SubscribeProcessorsTest.shouldRejectSubscribeOverConnectionLimit`、
+  `CoreChainIntegrationTest.shouldLimitSubscriptionsPerConnection`。
+  注意：批量对账不注册推送订阅关系（纯读），不会绕过上限。
 
-### ISSUE-10 定时对账逐 key 同步请求
+### ISSUE-10 定时对账逐 key 同步请求（已修复，2026-11-01）
 
 - 位置：`PolyConfigClient.resyncSafely`
 - 现状：每 30 秒对每个订阅 key 发一次同步 `invokeSync`。
 - 风险：订阅多时对账耗时长；服务端故障时每个 key 都要重试所有节点。
 - 建议：批量订阅接口、按 revision 增量拉取、首次失败后短路并退避。
 - 验证：模拟 1000 个订阅和服务端离线，测量对账耗时与请求数。
+- 修复：新增协议码 `BATCH_SUBSCRIBE`（1004）与 `BatchSubscribeProcessor`（单批上限
+  1024 键）。客户端对账改为按批（每批 512 键）携带每键的 md5 + revision 一次往返，
+  服务端只返回差异：内容有变更的完整视图进 `changed`、客户端声明持有但服务端已无的键进
+  `deleted`、未变更与首次订阅的缺失键不返回。N 个订阅从 N 次往返降为 ceil(N/512) 次。
+  整轮失败（所有服务端不可达）短路退出，按连续失败次数指数退避（1/2/4/8 个对账周期封顶），
+  成功后复位——服务端故障期间不再逐 key 重试所有节点。删除场景对账收敛：批量响应中的
+  `deleted` 触发 `applyDeletion`，单键订阅路径对"声明持有但已不存在"返回
+  `RESPONSE_NOT_FOUND`（首次订阅缺失键仍返回成功，订阅尚不存在的配置是合法用法）。
+  测试见 `SubscribeProcessorsTest.shouldReturnOnlyDiffInBatch`、
+  `CoreChainIntegrationTest.shouldResyncChangeAfterServerRestart`（服务端重启后订阅关系
+  丢失、推送不可能送达，新变更完全由对账补发）。
+  兼容性注意：旧客户端对新服务端可用（单键协议语义向后兼容）；新客户端对旧服务端的
+  批量对账会失败并退避，回退为不产生流量而非错误数据（协议版本策略仍由 ISSUE-22 跟进）。
 
-### ISSUE-11 addListener 同步初始订阅可能阻塞
+### ISSUE-11 addListener 同步初始订阅可能阻塞（已修复：短超时有界同步，2026-11-01）
 
 - 位置：`PolyConfigClient.addListener` → `subscribe`
 - 现状：添加监听器时同步发订阅请求，服务端不可用会按超时逐个尝试地址。
@@ -187,6 +216,14 @@
 - 风险：业务启动阶段注册多个监听器时被阻塞。
 - 建议：初始订阅改为异步，先读本地快照，后台重试；或提供同步/异步两种 API。
 - 验证：服务端离线时 `addListener` 立即返回，监听器在未来恢复后仍能收到变更。
+- 修复：`addListener` 先同步读取本地快照填充缓存（注册后立即可读），初始订阅改用
+  **200ms 短超时**的有界同步：连接被拒立即返回，网络黑洞最多阻塞 200ms × 地址数
+  （原为请求超时 3s × 地址数）；失败仅 WARN，由定时对账补救。同一 key 仅首个监听器
+  触发订阅。
+  设计取舍：曾实现为全异步（提交后台线程），但会破坏"addListener 返回时服务端订阅已生效"
+  的顺序契约——注册后立即发生的变更会漏推送（只能等对账），对"注册监听 → 发布"的常见
+  用法是回归。短超时有界同步在阻塞上界与推送及时性之间取折中。
+  测试见 `PolyConfigClientTest.shouldRegisterListenerWithoutBlockingWhenServerUnavailable`。
 
 ### ISSUE-12 历史只存在内存、按条数截断
 
@@ -196,13 +233,19 @@
 - 建议：历史独立落盘或纳入快照；保留策略按时间/版本可配置；API 分页读取。
 - 验证：写入超过 `historyLimit` 次变更，确认历史策略和重启后的可见范围符合预期。
 
-### ISSUE-13 HTTP 请求体无大小限制
+### ISSUE-13 HTTP 请求体无大小限制（已修复，2026-11-01）
 
 - 位置：`ApiHandler.readBody`
 - 现状：一次性读入完整请求体，没有上限；remoting 解码有 16MB 限制，HTTP 没有对应限制。
 - 风险：超大配置内容造成堆内存压力和 DoS。
 - 建议：增加最大请求体配置（例如 1MB），超限返回 413；与单条配置大小上限保持一致。
 - 验证：发送超过上限的请求，确认返回 413 且服务端内存稳定。
+- 修复：`readBody` 双重防护——Content-Length 声明超限直接拒绝（不读流），流式读取
+  累计超限即中断（防 chunked/伪报 Content-Length）。新增 `ErrorCode.PAYLOAD_TOO_LARGE`
+  （41301）映射 HTTP 413。上限可配置 `--max-body-bytes`（默认 1MB，须 > 0），
+  `ApiHandler` 增加带上限的构造器。测试见
+  `CoreChainIntegrationTest.shouldRejectOversizedBodyWith413`、
+  `ServerOptionsTest.shouldDefaultSubscriptionLimitAndBodyBytes`。
 
 ### ISSUE-14 list / history 无分页
 

@@ -160,7 +160,7 @@ public class WorkspaceRegistry {
                 Files.createDirectories(parent);
             }
             Path temp = file.resolveSibling(file.getFileName().toString() + ".tmp");
-            Files.write(temp, JsonUtils.toJson(data).getBytes(StandardCharsets.UTF_8),
+            Files.write(temp, JsonUtils.toPrettyJson(data).getBytes(StandardCharsets.UTF_8),
                     StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.WRITE);

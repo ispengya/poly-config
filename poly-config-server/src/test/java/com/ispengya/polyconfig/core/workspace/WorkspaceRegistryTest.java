@@ -36,4 +36,31 @@ public class WorkspaceRegistryTest {
         assertEquals(Arrays.asList("DEFAULT_GROUP"), reloaded.groups("missing"));
         assertTrue(Files.isRegularFile(file));
     }
+
+    @Test
+    public void shouldPersistPrettyPrintedJson() throws Exception {
+        Path file = folder.newFolder("pretty").toPath().resolve("workspaces.json");
+
+        WorkspaceRegistry registry = new WorkspaceRegistry(file);
+        registry.createNamespace("dev");
+
+        String json = new String(Files.readAllBytes(file), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue("工作区元数据应为格式化 JSON（含换行）", json.contains("\n"));
+        assertTrue("工作区元数据应包含缩进", json.matches("(?s).*\\n\\s+\"dev\".*"));
+
+        WorkspaceRegistry reloaded = new WorkspaceRegistry(file);
+        assertTrue(reloaded.namespaces().contains("dev"));
+    }
+
+    @Test
+    public void shouldLoadLegacyCompactWorkspaceFile() throws Exception {
+        Path file = folder.newFolder("legacy").toPath().resolve("workspaces.json");
+        // 旧版紧凑单行格式仍可加载
+        String compact = "{\"public\":[\"DEFAULT_GROUP\",\"ORDER\"]}";
+        Files.write(file, compact.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        WorkspaceRegistry reloaded = new WorkspaceRegistry(file);
+        assertTrue(reloaded.namespaces().contains("public"));
+        assertTrue(reloaded.groups("public").contains("ORDER"));
+    }
 }

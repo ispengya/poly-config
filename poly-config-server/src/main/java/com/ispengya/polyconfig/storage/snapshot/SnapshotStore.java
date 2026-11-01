@@ -69,7 +69,7 @@ public final class SnapshotStore {
         Path temp = dir.resolve(target.getFileName() + ".tmp");
         try {
             Files.createDirectories(dir);
-            byte[] json = JsonUtils.toJson(data).getBytes(StandardCharsets.UTF_8);
+            byte[] json = JsonUtils.toPrettyJson(data).getBytes(StandardCharsets.UTF_8);
             Files.write(temp, json, StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
             try {

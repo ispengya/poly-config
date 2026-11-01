@@ -41,6 +41,20 @@ public class DistroProtocolTest {
                 new ClusterMember("node-3", "127.0.0.1", 18850, 19850));
     }
 
+    /**
+     * 找一个归属 node-1 的分组：AP-2 起非 owner 分区的写会转发，
+     * 单节点测试必须写本节点拥有的分区。
+     */
+    private static String ownedGroup(DistroProtocol protocol) {
+        for (int i = 0; i < 200; i++) {
+            String group = "G" + i;
+            if (protocol.assignments().ownerOf("public", group).getNodeId().equals("node-1")) {
+                return group;
+            }
+        }
+        throw new IllegalStateException("未找到归属 node-1 的分组");
+    }
+
     @Test
     public void shouldProposeReadAndReportApStatus() throws Exception {
         Path dataDir = folder.newFolder("ap-data").toPath();
@@ -50,7 +64,7 @@ public class DistroProtocolTest {
             protocol.setNodeAddress("127.0.0.1", 18848, 19848);
             protocol.start();
 
-            ConfigKey key = new ConfigKey("public", "DEFAULT_GROUP", "app.yml");
+            ConfigKey key = new ConfigKey("public", ownedGroup(protocol), "app.yml");
             MutationResult result = protocol.propose(new ConfigCommand(
                     ConfigOperation.PUBLISH, key, "port: 8080", ConfigType.YAML,
                     "tester", System.currentTimeMillis()));
@@ -95,9 +109,9 @@ public class DistroProtocolTest {
     @Test
     public void shouldPersistDataAcrossRestart() throws Exception {
         Path dataDir = folder.newFolder("ap-restart").toPath();
-        ConfigKey key = new ConfigKey("public", "DEFAULT_GROUP", "app.yml");
         DistroProtocol first = new DistroProtocol(
                 dataDir, "node-1", "test-cluster", 100, 0, members());
+        ConfigKey key = new ConfigKey("public", ownedGroup(first), "app.yml");
         try {
             first.propose(new ConfigCommand(
                     ConfigOperation.PUBLISH, key, "v1", ConfigType.YAML,

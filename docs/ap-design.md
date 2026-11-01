@@ -181,7 +181,7 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 
 ## 10. 与 LocalProtocol 的关系（工程建议）
 
-- 抽取 `LocalEngine`（日志 + 状态机 + 组提交 + 快照），`LocalProtocol` 与 `DistroProtocol` 都委托，避免两份 600 行代码各自演化。
+- 抽取 `LocalEngine`（日志 + 状态机 + 组提交 + 快照），`LocalProtocol` 与 `DistroProtocol` 都委托，避免两份 600 行代码各自演化。（✅ 2026-11-01 落地，见 AP-2 实施记录）
 - 引擎两个入口：
   - `proposeLocal`：owner 路径——校验 expectedVersion、分配 version、落盘（≈ 现 propose）。
   - `applyReplicated`：副本路径——version 用复制批次携带的值，不自行分配，仍走本地日志+快照（重启不依赖 peers 在线）。
@@ -192,12 +192,44 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | AP-1（✅ 2026-11-01） | 成员配置（`--cluster-members`）+ DistroProtocol 骨架（先委托本地引擎），mode=ap 可启动 | 3 节点独立工作，状态页正确 |
-| AP-2 | 写转发：任意节点 publish → owner 生效；转发节点同步 apply（写后即读）；expectedVersion 语义保持 | 409 冲突照常；发布后原节点立即可读 |
+| AP-2（✅ 2026-11-01） | 写转发：任意节点 publish → owner 生效；转发节点同步 apply（写后即读）；expectedVersion 语义保持 | 409 冲突照常；发布后原节点立即可读 |
 | AP-3 | 异步复制 + 副本本地读/推送 | 写 owner，连非 owner 的客户端收到推送 |
 | AP-4 | 校验/反熵 + 重启收敛 | 杀副本/杀 owner/滚动重启后数据收敛 |
 | AP-5 | 集群集成测试矩阵 + 控制台集群页（每节点 ownedPartitions、复制滞后、校验时间、健康） | 完整演示 |
 
 验收总目标：3 节点 loopback，写任意节点 → 全集群可读可推送；owner 宕机重启后数据完整。
+
+### AP-2 实施记录（2026-11-01，已完成）
+
+- **LocalEngine 抽取**（§10 落地）：`core/engine/LocalEngine` 承载日志 + 状态机 + 组提交 +
+  快照，两个写入口——`proposeLocal`（本地/owner：校验 expectedVersion、分配版本、落盘）、
+  `applyReplicated`（副本：使用命令携带的 `assignedVersion`，同样落本地日志并等待刷盘）。
+  `LocalProtocol` 与 `DistroProtocol` 均委托引擎，不再各自持有存储。
+- **版本语义迁移**（§8 落地）：
+  - 状态机 `apply(command, revision, version)`：本地路径 version=revision（standalone 与
+    owner 行为不变）；副本路径 version=owner 分配值，与节点本地 revision 解耦。
+  - `ConfigCommand.assignedVersion` 参与 `CommandCodec` 编码（JSON 可选字段），
+    重启回放后版本与 owner 一致；旧日志缺该字段按本地分配回退，向后兼容。
+  - `expectedVersion` 改与 per-key `version` 比较（原为 revision）——跨节点语义唯一正确。
+  - 订阅/对账声明字段 `revision` 更名 `version`（`SubscribeRequest`/`SubscribeItem`），
+    服务端 `isUnchanged` 比较 `entry.getVersion()`，md5 兜底保证新旧协议互通。
+  - 客户端单调守卫（ISSUE-02）从 revision 切换为 version（`versionCache`），
+    推送删除守卫同步用 `PushEvent.version`。
+- **写转发**（3xxx 内部协议，复用 remoting 端口）：
+  - `DISTRO_FORWARD`(3001)：任意节点 → owner；owner 侧 `DistroForwardProcessor`
+    直接 `proposeLocal`（不经 ConfigService，避免二次路由），应答携带 owner 分配的
+    version 与命令回显。
+  - 转发节点收到应答后 `applyReplicated` 同步 apply（写后即读），再应答 HTTP 调用方；
+    已应答的写在转发节点同样持久化。
+  - owner 不可达 → `UNAVAILABLE`（HTTP 503），错误信息带 owner 节点 ID；
+    版本冲突 → 409，NOT_FOUND → 404。
+  - `DISTRO_READ`(3002)：`LINEARIZABLE` 读转发 owner；`ConfigService.get` 默认改
+    `LOCAL`（§4 控制台/SDK 路径）。
+- 读语义：默认 LOCAL；LINEARIZABLE 转发 owner 已实现，当前无默认调用方。
+- workspace 元数据仍为各节点本地登记，AP-3 随复制一起集群化（§8 既定计划）。
+- 测试：`ApForwardIntegrationTest`（2：非 owner 发布→owner 生效+转发节点写后即读+
+  跨节点 409/200 乐观锁；owner 宕机→503）；`DistroProtocolTest` 改为写本节点拥有的
+  分区；`ApClusterIntegrationTest` 改单成员集群；客户端 ISSUE-02 测试改按 version 断言。
 
 ### AP-1 实施记录（2026-11-01，已完成）
 
@@ -241,3 +273,6 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 | 2026-11-01 | workspace 元数据作为内置分区走同一复制链路 |
 | 2026-11-01 | 删除为带 version 的墓碑，v1 不 GC |
 | 2026-11-01 | 工程上抽 LocalEngine 复用 LocalProtocol 引擎（待实施时最终确认） |
+| 2026-11-01 | LocalEngine 落地：proposeLocal / applyReplicated 两入口，expectedVersion 改比 per-key version |
+| 2026-11-01 | 订阅/对账与客户端守卫的比较基准由 revision 切换为 version（wire 字段更名，md5 兜底兼容） |
+| 2026-11-01 | ConfigService 默认读改 LOCAL；LINEARIZABLE 转发 owner 已实现但无默认调用方 |

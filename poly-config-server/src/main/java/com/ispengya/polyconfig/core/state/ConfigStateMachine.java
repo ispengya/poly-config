@@ -74,6 +74,22 @@ public class ConfigStateMachine implements StateMachine {
 
     @Override
     public synchronized void apply(ConfigCommand command, long revision) {
+        // 本地分配路径：version = revision（owner 本机与 standalone 语义不变）
+        apply(command, revision, revision);
+    }
+
+    /**
+     * 应用一条命令。
+     *
+     * <p>{@code version} 是跨节点权威序号：本地分配时等于 {@code revision}；
+     * AP 副本路径传 owner 分配的版本（见 {@code ConfigCommand.assignedVersion}），
+     * 此时 version 与节点本地 revision 解耦。</p>
+     *
+     * @param command 配置命令
+     * @param revision 节点本地变更序号
+     * @param version 条目版本（跨节点权威）
+     */
+    public synchronized void apply(ConfigCommand command, long revision, long version) {
         if (command == null) {
             throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "command 不能为空");
         }
@@ -81,10 +97,10 @@ public class ConfigStateMachine implements StateMachine {
         switch (command.getOperation()) {
             case PUBLISH:
             case ROLLBACK:
-                event = applyPublish(command, revision);
+                event = applyPublish(command, revision, version);
                 break;
             case DELETE:
-                event = applyDelete(command, revision);
+                event = applyDelete(command, revision, version);
                 break;
             default:
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
@@ -93,7 +109,7 @@ public class ConfigStateMachine implements StateMachine {
         notifyListeners(event);
     }
 
-    private ConfigChangeEvent applyPublish(ConfigCommand command, long revision) {
+    private ConfigChangeEvent applyPublish(ConfigCommand command, long revision, long version) {
         ConfigKey key = command.getKey();
         String content = command.getContent();
         ConfigType type = command.getType();
@@ -101,15 +117,15 @@ public class ConfigStateMachine implements StateMachine {
         long now = command.getTimestamp();
         ConfigEntry existing = current.get(key);
         long createdTime = existing == null ? now : existing.getCreatedTime();
-        ConfigEntry entry = new ConfigEntry(key, content, type, md5, revision, revision,
+        ConfigEntry entry = new ConfigEntry(key, content, type, md5, version, revision,
                 createdTime, now, command.getOperator());
         current.put(key, entry);
         addHistory(new HistoryEntry(key, revision, command.getOperation(), content, type, md5,
                 command.getOperator(), now));
-        return new ConfigChangeEvent(key, command.getOperation(), md5, revision, revision, now);
+        return new ConfigChangeEvent(key, command.getOperation(), md5, version, revision, now);
     }
 
-    private ConfigChangeEvent applyDelete(ConfigCommand command, long revision) {
+    private ConfigChangeEvent applyDelete(ConfigCommand command, long revision, long version) {
         ConfigKey key = command.getKey();
         ConfigEntry existing = current.remove(key);
         long now = command.getTimestamp();
@@ -118,7 +134,7 @@ public class ConfigStateMachine implements StateMachine {
         String md5 = existing == null ? "" : existing.getMd5();
         addHistory(new HistoryEntry(key, revision, command.getOperation(), content, type, md5,
                 command.getOperator(), now));
-        return new ConfigChangeEvent(key, command.getOperation(), "", revision, revision, now);
+        return new ConfigChangeEvent(key, command.getOperation(), "", version, revision, now);
     }
 
     private void addHistory(HistoryEntry entry) {

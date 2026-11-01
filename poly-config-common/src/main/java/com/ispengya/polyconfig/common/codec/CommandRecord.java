@@ -54,6 +54,13 @@ public class CommandRecord {
      */
     private long timestamp;
 
+    /**
+     * owner 分配的版本号；本地分配的命令为 {@code null}（旧日志同样缺省）。
+     *
+     * <p>JSON 可选字段：旧记录没有该字段时回放按"本地分配"处理，向后兼容。</p>
+     */
+    private Long version;
+
     public CommandRecord() {
     }
 
@@ -73,6 +80,7 @@ public class CommandRecord {
         record.type = command.getType().name();
         record.operator = command.getOperator();
         record.timestamp = command.getTimestamp();
+        record.version = command.getAssignedVersion();
         return record;
     }
 
@@ -85,8 +93,10 @@ public class CommandRecord {
         try {
             ConfigOperation configOperation = ConfigOperation.valueOf(operation);
             ConfigKey key = new ConfigKey(namespace, group, dataId);
-            return new ConfigCommand(configOperation, key, content,
+            ConfigCommand command = new ConfigCommand(configOperation, key, content,
                     ConfigType.from(type), operator, timestamp);
+            command.setAssignedVersion(version);
+            return command;
         } catch (RuntimeException e) {
             throw new PolyConfigException(ErrorCode.STORAGE_ERROR, "日志命令字段非法", e);
         }
@@ -154,5 +164,13 @@ public class CommandRecord {
 
     public void setTimestamp(long timestamp) {
         this.timestamp = timestamp;
+    }
+
+    public Long getVersion() {
+        return version;
+    }
+
+    public void setVersion(Long version) {
+        this.version = version;
     }
 }

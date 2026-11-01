@@ -86,7 +86,10 @@ public class ConfigService {
      */
     public Optional<ConfigEntry> get(String namespace, String group, String dataId) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
-        return protocol.read(key, ReadConsistency.LINEARIZABLE);
+        // 默认 LOCAL（docs/ap-design.md §4）：全量副本下本地读即可，
+        // 控制台/SDK 的读后即写由写链路的"转发节点先 apply 再应答"保证；
+        // 需要强一致的调用方直接使用 protocol.read(key, LINEARIZABLE)
+        return protocol.read(key, ReadConsistency.LOCAL);
     }
 
     /**
@@ -111,7 +114,8 @@ public class ConfigService {
      */
     public MutationResult delete(String namespace, String group, String dataId, String operator) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
-        if (!protocol.read(key, ReadConsistency.LINEARIZABLE).isPresent()) {
+        // 存在性检查读本地：写最终由 owner 校验，本地检查只是快速失败
+        if (!protocol.read(key, ReadConsistency.LOCAL).isPresent()) {
             throw new PolyConfigException(ErrorCode.NOT_FOUND, "配置不存在: " + key.toPath());
         }
         return protocol.propose(ConfigCommand.delete(key, normalizeOperator(operator)));

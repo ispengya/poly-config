@@ -31,6 +31,16 @@ public final class ProtocolCodes {
     public static final int PUSH_CONFIG_CHANGED = 2001;
 
     /**
+     * AP 写转发：任意节点把写请求转发给分区 owner（3xxx 段为服务端内部协议）。
+     */
+    public static final int DISTRO_FORWARD = 3001;
+
+    /**
+     * AP 线性读：读请求转发到分区 owner。
+     */
+    public static final int DISTRO_READ = 3002;
+
+    /**
      * 响应成功。
      */
     public static final int RESPONSE_OK = 200;
@@ -39,6 +49,11 @@ public final class ProtocolCodes {
      * 请求参数错误。
      */
     public static final int RESPONSE_BAD_REQUEST = 400;
+
+    /**
+     * 乐观锁版本冲突。
+     */
+    public static final int RESPONSE_VERSION_CONFLICT = 409;
 
     /**
      * 资源不存在。

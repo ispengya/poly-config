@@ -2,6 +2,10 @@ package com.ispengya.polyconfig.common.protocol;
 
 /**
  * 客户端订阅请求。
+ *
+ * <p>兼容性：字段 {@code revision} 更名为 {@code version}（跨节点权威序号）。
+ * 新客户端对旧服务端：旧端读不到 revision 字段按 0 处理，md5 兜底仍然生效；
+ * 旧客户端对新服务端同理。</p>
  */
 public class SubscribeRequest {
 
@@ -26,9 +30,9 @@ public class SubscribeRequest {
     private String md5;
 
     /**
-     * 客户端当前持有的条目 revision，首次订阅或未知时为 0。
+     * 客户端当前持有的条目 version（跨节点权威），首次订阅或未知时为 0。
      */
-    private long revision;
+    private long version;
 
     public SubscribeRequest() {
     }
@@ -40,26 +44,26 @@ public class SubscribeRequest {
      * @param group 分组
      * @param dataId 配置项 ID
      * @param md5 客户端当前 MD5
-     * @param revision 客户端当前 revision，未知时传 0
+     * @param version 客户端当前 version，未知时传 0
      * @return 订阅请求
      */
     public static SubscribeRequest of(String namespace, String group, String dataId,
-                                      String md5, long revision) {
+                                      String md5, long version) {
         SubscribeRequest request = new SubscribeRequest();
         request.namespace = namespace;
         request.group = group;
         request.dataId = dataId;
         request.md5 = md5;
-        request.revision = revision;
+        request.version = version;
         return request;
     }
 
-    public long getRevision() {
-        return revision;
+    public long getVersion() {
+        return version;
     }
 
-    public void setRevision(long revision) {
-        this.revision = revision;
+    public void setVersion(long version) {
+        this.version = version;
     }
 
     public String getNamespace() {

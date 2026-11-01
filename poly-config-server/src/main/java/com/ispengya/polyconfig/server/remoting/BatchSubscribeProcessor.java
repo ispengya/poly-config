@@ -81,10 +81,10 @@ public class BatchSubscribeProcessor implements NettyRequestProcessor {
                         target.getGroup(), target.getDataId());
                 if (entry.isPresent()) {
                     if (!SubscribeProcessor.isUnchanged(
-                            target.getRevision(), target.getMd5(), entry.get())) {
+                            target.getVersion(), target.getMd5(), entry.get())) {
                         changed.add(ConfigView.from(entry.get()));
                     }
-                } else if (target.getRevision() > 0
+                } else if (target.getVersion() > 0
                         || (target.getMd5() != null && !target.getMd5().isEmpty())) {
                     // 客户端声明持有但服务端已无此键 → 已删除
                     deleted.add(target);

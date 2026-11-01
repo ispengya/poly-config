@@ -50,6 +50,16 @@ public final class ConfigCommand {
     private final Long expectedVersion;
 
     /**
+     * 副本路径携带的 owner 分配版本；本地分配时为 {@code null}。
+     *
+     * <p>AP 模式下，副本（含转发节点同步 apply）应用复制来的命令时使用 owner
+     * 在分配时刻的版本号，而不是本地 revision——revision 是节点本地位点，
+     * version 才是跨节点权威序号。该字段参与 {@code CommandCodec} 编码，
+     * 保证重启回放后版本与 owner 一致；回放命令不携带时按"本地分配"处理。</p>
+     */
+    private Long assignedVersion;
+
+    /**
      * 创建配置命令。
      *
      * @param operation 变更操作
@@ -152,5 +162,13 @@ public final class ConfigCommand {
 
     public Long getExpectedVersion() {
         return expectedVersion;
+    }
+
+    public Long getAssignedVersion() {
+        return assignedVersion;
+    }
+
+    public void setAssignedVersion(Long assignedVersion) {
+        this.assignedVersion = assignedVersion;
     }
 }

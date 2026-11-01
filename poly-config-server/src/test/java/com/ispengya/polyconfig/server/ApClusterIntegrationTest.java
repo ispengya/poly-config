@@ -28,11 +28,8 @@ import static org.junit.Assert.fail;
  */
 public class ApClusterIntegrationTest {
 
-    // 隔离端口段，避免成员探测打到本机上正在运行的演示集群
-    private static final String MEMBERS =
-            "node-1=127.0.0.1:18848:19848,"
-                    + "node-2=127.0.0.1:18849:19849,"
-                    + "node-3=127.0.0.1:18850:19850";
+    // 单成员集群：所有分区都归本节点，无转发；隔离端口段避免打到演示集群
+    private static final String MEMBERS = "node-1=127.0.0.1:18848:19848";
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
@@ -47,7 +44,7 @@ public class ApClusterIntegrationTest {
             JSONObject clusterData = JSON.parseObject(cluster.body).getJSONObject("data");
             assertEquals("AP", clusterData.getString("mode"));
             assertEquals("node-1", clusterData.getString("currentNodeId"));
-            assertEquals(3, clusterData.getJSONArray("nodes").size());
+            assertEquals(1, clusterData.getJSONArray("nodes").size());
             JSONObject self = clusterData.getJSONArray("nodes").getJSONObject(0);
             assertEquals("node-1", self.getString("nodeId"));
             assertEquals("PEER", self.getString("role"));

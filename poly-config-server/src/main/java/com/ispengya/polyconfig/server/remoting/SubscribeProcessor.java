@@ -67,9 +67,9 @@ public class SubscribeProcessor implements NettyRequestProcessor {
             Optional<ConfigEntry> entry = configService.get(key.getNamespace(),
                     key.getGroup(), key.getDataId());
             if (!entry.isPresent()) {
-                // 客户端声明持有版本（revision>0 或 md5 非空）但服务端已无此键，说明已删除；
+                // 客户端声明持有版本（version>0 或 md5 非空）但服务端已无此键，说明已删除；
                 // 首次订阅（两者皆空）不存在可删内容，按"暂无配置"成功返回
-                if (subscribe.getRevision() > 0
+                if (subscribe.getVersion() > 0
                         || (subscribe.getMd5() != null && !subscribe.getMd5().isEmpty())) {
                     return RemotingCommand.createResponseCommand(
                             ProtocolCodes.RESPONSE_NOT_FOUND, "配置不存在");
@@ -79,7 +79,7 @@ public class SubscribeProcessor implements NettyRequestProcessor {
             }
             RemotingCommand response = RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_OK, "ok");
-            if (isUnchanged(subscribe.getRevision(), subscribe.getMd5(), entry.get())) {
+            if (isUnchanged(subscribe.getVersion(), subscribe.getMd5(), entry.get())) {
                 return response;
             }
             response.setBody(JsonUtils.toJson(ConfigView.from(entry.get()))
@@ -98,13 +98,15 @@ public class SubscribeProcessor implements NettyRequestProcessor {
     /**
      * 判断客户端声明的版本与服务端当前条目一致。
      *
-     * @param clientRevision 客户端持有的 revision，0 表示未知
+     * <p>比较跨节点权威的 version；md5 作为内容等价兜底（新旧协议兼容）。</p>
+     *
+     * @param clientVersion 客户端持有的 version，0 表示未知
      * @param clientMd5 客户端持有的 MD5，空表示未知
      * @param entry 服务端当前条目
      * @return 内容未变更返回 {@code true}
      */
-    static boolean isUnchanged(long clientRevision, String clientMd5, ConfigEntry entry) {
-        if (clientRevision > 0 && clientRevision == entry.getRevision()) {
+    static boolean isUnchanged(long clientVersion, String clientMd5, ConfigEntry entry) {
+        if (clientVersion > 0 && clientVersion == entry.getVersion()) {
             return true;
         }
         return clientMd5 != null && !clientMd5.isEmpty()

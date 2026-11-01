@@ -12,6 +12,7 @@ import com.ispengya.polyconfig.server.http.StaticFileHandler;
 import com.ispengya.polyconfig.server.push.ChangePusher;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.remoting.BatchSubscribeProcessor;
+import com.ispengya.polyconfig.server.remoting.DistroForwardProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -130,6 +131,15 @@ public class PolyConfigServer {
                 new BatchSubscribeProcessor(configService), remotingExecutor);
         this.remotingServer.registerProcessor(ProtocolCodes.FETCH,
                 new FetchProcessor(configService), remotingExecutor);
+        if (protocol instanceof DistroProtocol) {
+            // owner 侧节点间转发（3xxx 内部协议）：写转发与线性读共用一个处理器
+            DistroForwardProcessor forwardProcessor =
+                    new DistroForwardProcessor(((DistroProtocol) protocol).engine());
+            this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_FORWARD,
+                    forwardProcessor, remotingExecutor);
+            this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_READ,
+                    forwardProcessor, remotingExecutor);
+        }
 
         this.changePusher = new ChangePusher(remotingServer, registry);
         this.configService.addChangeListener(changePusher);

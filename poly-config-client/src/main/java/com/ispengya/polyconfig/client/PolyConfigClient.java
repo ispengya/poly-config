@@ -74,9 +74,12 @@ public class PolyConfigClient implements ConfigService {
     private final ConcurrentHashMap<ConfigKey, String> md5Cache = new ConcurrentHashMap<>();
 
     /**
-     * 每个配置键最后应用的 revision，用于丢弃乱序到达的旧视图（ISSUE-02）。
+     * 每个配置键最后应用的 version（跨节点权威序号），用于丢弃乱序到达的旧视图（ISSUE-02）。
+     *
+     * <p>AP 模式下 revision 是节点本地序号、跨节点不可比，单调守卫以 owner 分配的
+     * version 为准；推送、拉取、对账共用此规则。</p>
      */
-    private final ConcurrentHashMap<ConfigKey, Long> revisionCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ConfigKey, Long> versionCache = new ConcurrentHashMap<>();
 
     /**
      * 每个配置键的应用锁，序列化缓存更新与通知提交。
@@ -290,7 +293,7 @@ public class PolyConfigClient implements ConfigService {
     private void subscribe(ConfigKey key, boolean notifyOnChange, long timeoutMillis) {
         SubscribeRequest request = SubscribeRequest.of(key.getNamespace(), key.getGroup(),
                 key.getDataId(), md5Cache.getOrDefault(key, ""),
-                revisionCache.getOrDefault(key, 0L));
+                versionCache.getOrDefault(key, 0L));
         RemotingCommand response = invokeWithFailover(ProtocolCodes.SUBSCRIBE,
                 JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8), timeoutMillis);
         if (response.getCode() == ProtocolCodes.RESPONSE_NOT_FOUND) {
@@ -392,12 +395,12 @@ public class PolyConfigClient implements ConfigService {
                 return;
             }
             if ("DELETE".equals(event.getOperation())) {
-                applyDeletion(key, event.getRevision());
+                applyDeletion(key, event.getVersion());
                 return;
             }
             ConfigView view = fetch(key, options.getRequestTimeoutMillis());
             if (view == null) {
-                applyDeletion(key, event.getRevision());
+                applyDeletion(key, event.getVersion());
                 return;
             }
             applyView(view, true);
@@ -411,8 +414,8 @@ public class PolyConfigClient implements ConfigService {
     /**
      * 应用配置视图。
      *
-     * <p>revision 小于已应用版本的旧视图直接丢弃（ISSUE-02）；同一 key 的缓存更新与
-     * 通知提交在键锁内完成，保证通知提交顺序与 revision 一致（ISSUE-03）。</p>
+     * <p>version 小于已应用版本的旧视图直接丢弃（ISSUE-02）；同一 key 的缓存更新与
+     * 通知提交在键锁内完成，保证通知提交顺序与 version 一致（ISSUE-03）。</p>
      *
      * @param view 配置视图
      * @param notify 内容变化时是否通知监听器
@@ -424,15 +427,15 @@ public class PolyConfigClient implements ConfigService {
         }
         ConfigKey key = new ConfigKey(view.getNamespace(), view.getGroup(), view.getDataId());
         String content = view.getContent() == null ? "" : view.getContent();
-        long revision = view.getRevision();
+        long version = view.getVersion();
         synchronized (lockFor(key)) {
-            long last = revisionCache.getOrDefault(key, -1L);
-            if (revision < last) {
-                log.debug("丢弃过期配置视图, key={}, revision={}, lastRevision={}",
-                        key, revision, last);
+            long last = versionCache.getOrDefault(key, -1L);
+            if (version < last) {
+                log.debug("丢弃过期配置视图, key={}, version={}, lastVersion={}",
+                        key, version, last);
                 return false;
             }
-            revisionCache.put(key, revision);
+            versionCache.put(key, version);
             String previous = contentCache.put(key, content);
             md5Cache.put(key, view.getMd5());
             writeSnapshot(key, content);
@@ -446,22 +449,22 @@ public class PolyConfigClient implements ConfigService {
     /**
      * 应用删除（推送删除或拉取不到内容）。
      *
-     * <p>携带 revision 时按单调守卫丢弃过期删除；revision 未知（小于等于 0）时
+     * <p>携带 version 时按单调守卫丢弃过期删除；version 未知（小于等于 0）时
      * 按旧行为直接删除。</p>
      *
      * @param key 配置键
-     * @param revision 删除事件的 revision，未知时传 0
+     * @param version 删除事件的 version，未知时传 0
      */
-    void applyDeletion(ConfigKey key, long revision) {
+    void applyDeletion(ConfigKey key, long version) {
         synchronized (lockFor(key)) {
-            long last = revisionCache.getOrDefault(key, -1L);
-            if (revision > 0 && revision < last) {
-                log.debug("丢弃过期删除, key={}, revision={}, lastRevision={}",
-                        key, revision, last);
+            long last = versionCache.getOrDefault(key, -1L);
+            if (version > 0 && version < last) {
+                log.debug("丢弃过期删除, key={}, version={}, lastVersion={}",
+                        key, version, last);
                 return;
             }
-            if (revision > 0) {
-                revisionCache.put(key, revision);
+            if (version > 0) {
+                versionCache.put(key, version);
             }
             contentCache.remove(key);
             md5Cache.remove(key);
@@ -566,7 +569,7 @@ public class PolyConfigClient implements ConfigService {
                     ConfigKey key = keys.get(i);
                     targets.add(SubscribeItem.of(key.getNamespace(), key.getGroup(),
                             key.getDataId(), md5Cache.getOrDefault(key, ""),
-                            revisionCache.getOrDefault(key, 0L)));
+                            versionCache.getOrDefault(key, 0L)));
                 }
                 resyncBatch(targets);
             }

@@ -156,14 +156,16 @@ public class PolyConfigClientTest {
         assertTrue("删除回调超时", deleted.await(5, TimeUnit.SECONDS));
     }
 
-    private static ConfigView view(String content, long revision) {
+    private static ConfigView view(String content, long version) {
         ConfigView view = new ConfigView();
         view.setNamespace("public");
         view.setGroup("DEFAULT_GROUP");
         view.setDataId("app.yml");
         view.setContent(content);
         view.setMd5(Md5Utils.md5Hex(content));
-        view.setRevision(revision);
+        // 单调守卫以跨节点权威的 version 为准（revision 是节点本地位点）
+        view.setVersion(version);
+        view.setRevision(version);
         return view;
     }
 }

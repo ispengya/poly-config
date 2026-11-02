@@ -15,6 +15,16 @@ public final class ConfigConstants {
      */
     public static final String DEFAULT_GROUP = "DEFAULT_GROUP";
 
+    /**
+     * 内置系统命名空间（AP 模式 workspace 元数据的归属，不对外展示）。
+     */
+    public static final String SYSTEM_NAMESPACE = "_system";
+
+    /**
+     * 内置工作区标记分组（AP 模式 ns/group 标记条目的归属，不对外展示）。
+     */
+    public static final String WORKSPACE_GROUP = "_workspaces";
+
     private ConfigConstants() {
     }
 }

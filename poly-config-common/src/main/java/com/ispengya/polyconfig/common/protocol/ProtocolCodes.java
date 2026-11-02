@@ -41,6 +41,11 @@ public final class ProtocolCodes {
     public static final int DISTRO_READ = 3002;
 
     /**
+     * AP 增量复制批次：owner 异步推送给其余副本。
+     */
+    public static final int DISTRO_SYNC = 3003;
+
+    /**
      * 响应成功。
      */
     public static final int RESPONSE_OK = 200;

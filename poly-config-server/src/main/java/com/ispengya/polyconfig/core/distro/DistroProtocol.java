@@ -3,8 +3,11 @@ package com.ispengya.polyconfig.core.distro;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.model.ConfigCommand;
+import com.ispengya.polyconfig.common.model.ConfigConstants;
 import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.ConfigKey;
+import com.ispengya.polyconfig.common.model.ConfigOperation;
+import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import com.ispengya.polyconfig.common.model.MutationResult;
 import com.ispengya.polyconfig.common.protocol.ConfigView;
@@ -13,6 +16,7 @@ import com.ispengya.polyconfig.common.protocol.ForwardWriteRequest;
 import com.ispengya.polyconfig.common.protocol.ForwardWriteResult;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.util.JsonUtils;
+import com.ispengya.polyconfig.common.util.Preconditions;
 import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.ClusterMember;
 import com.ispengya.polyconfig.consistency.ClusterStatus;
@@ -52,8 +56,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * （写后即读）并落本地日志。{@code LINEARIZABLE} 读转发 owner；
  * 默认 {@code LOCAL} 读本地副本。</p>
  *
- * <p>异步复制（AP-3）与校验/反熵（AP-4）尚未接入：非转发节点暂时看不到
- * 其他节点产生的变更。</p>
+ * <p>异步复制：owner 本地写刷盘后入 {@link DistroReplicator} 攒批，
+ * {@code DISTRO_SYNC} 推送其余副本；副本幂等 apply 并触发本地推送。
+ * 校验/反熵（AP-4）尚未接入，落后副本靠校验补齐。</p>
  */
 public class DistroProtocol implements ConfigProtocol {
 
@@ -90,9 +95,14 @@ public class DistroProtocol implements ConfigProtocol {
     private final DistroAssignments assignments;
 
     /**
-     * 节点间调用客户端（写转发、线性读）。
+     * 节点间调用客户端（写转发、线性读、复制）。
      */
     private final NettyRemotingClient remotingClient;
+
+    /**
+     * owner 侧异步复制器（本地写刷盘后攒批推送其余副本）。
+     */
+    private final DistroReplicator replicator;
 
     /**
      * 节点 ID。
@@ -153,6 +163,10 @@ public class DistroProtocol implements ConfigProtocol {
         this.assignments.member(nodeId);
         this.engine = new LocalEngine(dataDir, nodeId, clusterId, historyLimit, snapshotThreshold);
         this.remotingClient = new NettyRemotingClient();
+        this.replicator = new DistroReplicator(assignments, nodeId, remotingClient,
+                peerNodeId -> peerLastSeen.put(peerNodeId, System.currentTimeMillis()));
+        // 只有本地分配路径（owner）触发复制；副本 applyReplicated 不再向外复制
+        this.engine.setProposeListener(replicator::enqueue);
         this.probeExecutor =
                 Executors.newSingleThreadScheduledExecutor(daemonFactory("poly-config-probe"));
     }
@@ -160,6 +174,7 @@ public class DistroProtocol implements ConfigProtocol {
     @Override
     public void start() {
         remotingClient.start();
+        replicator.start();
         List<ClusterMember> members = assignments.members();
         log.info("DistroProtocol started, nodeId={}, clusterId={}, members={}, 本节点负责分区占比≈1/{}",
                 nodeId, clusterId, members, members.size());
@@ -304,14 +319,24 @@ public class DistroProtocol implements ConfigProtocol {
 
     @Override
     public void createNamespace(String namespace) {
-        // AP-3 起 workspace 元数据作为内置分区复制（docs/ap-design.md §8）；
-        // 当前阶段为各节点本地登记
-        engine.createNamespace(namespace);
+        // workspace 元数据作为内置分区走同一套复制（docs/ap-design.md §8）：
+        // (_system/_workspaces, dataId=命名空间名) 标记条目，经 owner 路由与异步复制
+        String target = Preconditions.checkNotBlank(namespace, "namespace");
+        propose(new ConfigCommand(ConfigOperation.PUBLISH,
+                new ConfigKey(ConfigConstants.SYSTEM_NAMESPACE,
+                        ConfigConstants.WORKSPACE_GROUP, target),
+                "", ConfigType.TEXT, "system", System.currentTimeMillis()));
     }
 
     @Override
     public void createGroup(String namespace, String group) {
-        engine.createGroup(namespace, group);
+        // 标记条目放在 (命名空间/_workspaces, dataId=分组名)：命名空间随之可见
+        String targetGroup = Preconditions.checkNotBlank(group, "group");
+        String targetNamespace = namespace == null || namespace.trim().isEmpty()
+                ? ConfigConstants.DEFAULT_NAMESPACE : namespace.trim();
+        propose(new ConfigCommand(ConfigOperation.PUBLISH,
+                new ConfigKey(targetNamespace, ConfigConstants.WORKSPACE_GROUP, targetGroup),
+                "", ConfigType.TEXT, "system", System.currentTimeMillis()));
     }
 
     @Override
@@ -398,6 +423,7 @@ public class DistroProtocol implements ConfigProtocol {
             closed = true;
         }
         probeExecutor.shutdownNow();
+        replicator.close();
         try {
             remotingClient.shutdown();
         } catch (RuntimeException e) {

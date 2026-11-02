@@ -4,6 +4,7 @@ import com.ispengya.polyconfig.common.codec.CommandCodec;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.model.ConfigCommand;
+import com.ispengya.polyconfig.common.model.ConfigConstants;
 import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.ConfigKey;
 import com.ispengya.polyconfig.common.model.ConfigOperation;
@@ -122,6 +123,11 @@ public class LocalEngine {
     private volatile boolean broken;
 
     /**
+     * 本地写成功后的回调；AP 模式下用于 owner 复制入队，standalone 不设置。
+     */
+    private volatile ProposeListener proposeListener;
+
+    /**
      * 上次快照以来的命令计数（写锁内访问）。
      */
     private long commandsSinceSnapshot;
@@ -230,7 +236,26 @@ public class LocalEngine {
             maybeTriggerSnapshotLocked(pending);
             pendingWrites.add(pending);
         }
-        return pending.await();
+        MutationResult result = pending.await();
+        // 刷盘成功后回调（owner 复制入队点）；仅本地分配路径，副本 apply 不触发
+        ProposeListener listener = this.proposeListener;
+        if (listener != null) {
+            try {
+                listener.onProposed(command, result);
+            } catch (RuntimeException e) {
+                log.warn("本地写回调执行失败, key={}", command.getKey(), e);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 设置本地写成功后的回调（owner 复制入队用）。
+     *
+     * @param listener 回调；{@code null} 表示移除
+     */
+    public void setProposeListener(ProposeListener listener) {
+        this.proposeListener = listener;
     }
 
     /**
@@ -293,13 +318,28 @@ public class LocalEngine {
         ensureOpen();
         Set<String> result = new TreeSet<>(workspaceRegistry.namespaces());
         result.addAll(stateMachine.namespaces());
+        // AP 内置分区里的命名空间标记条目（dataId 即命名空间名）
+        for (ConfigEntry entry : stateMachine.list(ConfigConstants.SYSTEM_NAMESPACE,
+                ConfigConstants.WORKSPACE_GROUP)) {
+            result.add(entry.getKey().getDataId());
+        }
+        // 内建系统命名空间不对外展示（standalone 不存在该条目，过滤为空操作）
+        result.remove(ConfigConstants.SYSTEM_NAMESPACE);
         return new ArrayList<>(result);
     }
 
     public List<String> groups(String namespace) {
         ensureOpen();
-        Set<String> result = new TreeSet<>(workspaceRegistry.groups(namespace));
-        result.addAll(stateMachine.groups(namespace));
+        String target = namespace == null || namespace.trim().isEmpty()
+                ? ConfigConstants.DEFAULT_NAMESPACE : namespace.trim();
+        Set<String> result = new TreeSet<>(workspaceRegistry.groups(target));
+        result.addAll(stateMachine.groups(target));
+        // AP 标记条目：(命名空间, _workspaces, 分组名)
+        for (ConfigEntry entry : stateMachine.list(target, ConfigConstants.WORKSPACE_GROUP)) {
+            result.add(entry.getKey().getDataId());
+        }
+        // 内建标记分组不对外展示
+        result.remove(ConfigConstants.WORKSPACE_GROUP);
         return new ArrayList<>(result);
     }
 
@@ -585,6 +625,24 @@ public class LocalEngine {
             thread.setDaemon(true);
             return thread;
         };
+    }
+
+    /**
+     * 本地写成功（已持久化）后的回调。
+     *
+     * <p>AP 模式由 {@code DistroProtocol} 注册，用于把 owner 分配的命令
+     * 入复制队列；仅 {@link #proposeLocal} 触发，副本 {@link #applyReplicated}
+     * 不触发——复制只从 owner 发起。</p>
+     */
+    public interface ProposeListener {
+
+        /**
+         * 本地写已提交并刷盘。
+         *
+         * @param command 已提交的配置命令
+         * @param result 提交结果（version 为本节点分配值）
+         */
+        void onProposed(ConfigCommand command, MutationResult result);
     }
 
     /**

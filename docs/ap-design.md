@@ -183,7 +183,7 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 
 - 抽取 `LocalEngine`（日志 + 状态机 + 组提交 + 快照），`LocalProtocol` 与 `DistroProtocol` 都委托，避免两份 600 行代码各自演化。（✅ 2026-11-01 落地，见 AP-2 实施记录）
 - 引擎两个入口：
-  - `proposeLocal`：owner 路径——校验 expectedVersion、分配 version、落盘（≈ 现 propose）。
+  - `proposeLocal`：owner 路径——校验 expectedVersion、分配 version、落盘（≈ 现 propose）；刷盘成功后触发 `ProposeListener`（AP-3 复制入队点，仅 DistroProtocol 注册）。
   - `applyReplicated`：副本路径——version 用复制批次携带的值，不自行分配，仍走本地日志+快照（重启不依赖 peers 在线）。
 - `LocalProtocol` 对外行为不变。
 
@@ -193,11 +193,41 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 |---|---|---|
 | AP-1（✅ 2026-11-01） | 成员配置（`--cluster-members`）+ DistroProtocol 骨架（先委托本地引擎），mode=ap 可启动 | 3 节点独立工作，状态页正确 |
 | AP-2（✅ 2026-11-01） | 写转发：任意节点 publish → owner 生效；转发节点同步 apply（写后即读）；expectedVersion 语义保持 | 409 冲突照常；发布后原节点立即可读 |
-| AP-3 | 异步复制 + 副本本地读/推送 | 写 owner，连非 owner 的客户端收到推送 |
+| AP-3（✅ 2026-11-01） | 异步复制 + 副本本地读/推送；workspace 元数据集群化 | 写 owner，连非 owner 的客户端收到推送 |
 | AP-4 | 校验/反熵 + 重启收敛 | 杀副本/杀 owner/滚动重启后数据收敛 |
 | AP-5 | 集群集成测试矩阵 + 控制台集群页（每节点 ownedPartitions、复制滞后、校验时间、健康） | 完整演示 |
 
 验收总目标：3 节点 loopback，写任意节点 → 全集群可读可推送；owner 宕机重启后数据完整。
+
+### AP-3 实施记录（2026-11-01，已完成）
+
+- **复制链路**（§3/§9 落地）：
+  - 入队点为 `LocalEngine.ProposeListener`：`proposeLocal` 刷盘成功后回调——owner 的
+    两条入口（本机写 + `DISTRO_FORWARD` 处理）天然覆盖；副本 `applyReplicated` 不触发，
+    复制只从 owner 发起。回调异常只告警不影响写应答。
+  - `DistroReplicator`（owner 侧）：入队即复制为 `CommandRecord` 并显式携带 owner 分配
+    版本（不改写调用方命令对象）；100ms 周期攒批，条数（128）与估算字节（512KB）双
+    上限、至少取一条；`DISTRO_SYNC`(3003) 推送全体 peers，单 peer 失败不影响其他 peer。
+  - 发送失败**不重试**：owner 在乎的只有「已应答的写已持久化」，落后副本由 AP-4
+    校验补齐（§7 既定）；同步成功点亮该 peer 的健康时间戳（复制交互参与故障检测，
+    展示探测仍保留至 AP-4）。
+  - 并发写完成顺序与入队顺序可能不一致，靠 per-key version 守卫兜底，乱序无害。
+- **副本应用**：`DistroSyncProcessor`（3003）逐条幂等——本地已有且 version 不小于
+  来值则丢弃；本地没有且是 DELETE 也丢弃（删除不改变现状）；否则 `applyReplicated`
+  （owner 版本 + 落本地日志 + 等刷盘）。状态机 apply 即触发 `ChangeListener` →
+  本地订阅推送（§5「apply 即推送」），连非 owner 的客户端收推送达成。
+- **workspace 元数据集群化**（§8 落地）：`DistroProtocol.createNamespace/createGroup`
+  改为 propose 标记条目——命名空间标记 `(_system/_workspaces, dataId=命名空间名)`，
+  分组标记 `(命名空间/_workspaces, dataId=分组名)`（分组标记使命名空间随之可见）；
+  `LocalEngine.namespaces()/groups()` 读时扫描标记条目并过滤预留名（`_system`、
+  `_workspaces` 不外显）。零状态机/快照格式改动，standalone 仍走 workspaces.json
+  本地登记。兼容说明：AP-3 之前各节点本地登记的 ns/group 不自动迁移，重建即可。
+- 测试：`DistroSyncProcessorTest`（5：新则应用/重复与过期丢弃、删除幂等、缺失发布
+  补应用、缺 owner 版本拒绝、空批次拒绝）；`ApSyncIntegrationTest`（2：owner 写 →
+  非 owner 收敛 + 连非 owner 客户端收到复制推送 + 跨节点乐观锁 409；ns/group 在
+  不同节点创建后全体可见且 `_system` 不外显）。
+- 实机验证：3 节点演示集群 + 3 客户端，经 node-1 发布 → 三节点全部收敛 version=1、
+  三个客户端全部收到推送；`tenant-a/billing` 分别经 node-1/node-2 创建，三节点可见。
 
 ### AP-2 实施记录（2026-11-01，已完成）
 
@@ -276,3 +306,6 @@ AP-4 校验接入后由"最近一次校验成功时间"点亮健康位，该探�
 | 2026-11-01 | LocalEngine 落地：proposeLocal / applyReplicated 两入口，expectedVersion 改比 per-key version |
 | 2026-11-01 | 订阅/对账与客户端守卫的比较基准由 revision 切换为 version（wire 字段更名，md5 兜底兼容） |
 | 2026-11-01 | ConfigService 默认读改 LOCAL；LINEARIZABLE 转发 owner 已实现但无默认调用方 |
+| 2026-11-01 | 复制入队点为 LocalEngine.ProposeListener（proposeLocal 刷盘成功后触发），仅 owner 本地路径复制 |
+| 2026-11-01 | 复制发送失败不重试，落后副本由 AP-4 校验补齐；同步成功点亮 peer 健康位 |
+| 2026-11-01 | workspace 元数据落地为内置分区标记条目，读时派生并过滤预留名 |

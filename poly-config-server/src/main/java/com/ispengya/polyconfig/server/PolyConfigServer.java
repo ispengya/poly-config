@@ -13,6 +13,7 @@ import com.ispengya.polyconfig.server.push.ChangePusher;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.remoting.BatchSubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroForwardProcessor;
+import com.ispengya.polyconfig.server.remoting.DistroSyncProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -139,6 +140,10 @@ public class PolyConfigServer {
                     forwardProcessor, remotingExecutor);
             this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_READ,
                     forwardProcessor, remotingExecutor);
+            // 副本侧复制批次应用
+            this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_SYNC,
+                    new DistroSyncProcessor(((DistroProtocol) protocol).engine()),
+                    remotingExecutor);
         }
 
         this.changePusher = new ChangePusher(remotingServer, registry);

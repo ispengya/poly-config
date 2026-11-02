@@ -192,7 +192,9 @@ public class PolyConfigServer {
         String advertisedHost = resolveAdvertisedHost();
         protocol.setNodeAddress(advertisedHost, getHttpPort(), getRemotingPort());
         started = true;
-        log.info("poly-config started, http={}:{}, remoting={}, advertised={}, dataDir={}",
+        log.info("poly-config started, nodeId={}, mode={}, clusterId={}, http={}:{}, "
+                        + "remoting={}, advertised={}, dataDir={}",
+                options.getNodeId(), options.getMode(), options.getClusterId(),
                 options.getHost(), getHttpPort(), getRemotingPort(), advertisedHost,
                 options.getDataDir());
     }

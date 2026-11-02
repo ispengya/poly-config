@@ -49,6 +49,7 @@ public class UnsubscribeProcessor implements NettyRequestProcessor {
             ConfigKey key = new ConfigKey(unsubscribe.getNamespace(), unsubscribe.getGroup(),
                     unsubscribe.getDataId());
             registry.unsubscribe(ctx.channel(), key);
+            log.info("取消订阅, remote={}, key={}", ctx.channel().remoteAddress(), key);
             return RemotingCommand.createResponseCommand(ProtocolCodes.RESPONSE_OK, "ok");
         } catch (PolyConfigException e) {
             return RemotingCommand.createResponseCommand(

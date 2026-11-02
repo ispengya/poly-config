@@ -93,6 +93,14 @@ public class BatchSubscribeProcessor implements NettyRequestProcessor {
             }
             response.setChanged(changed);
             response.setDeleted(deleted);
+            if (!changed.isEmpty() || !deleted.isEmpty()) {
+                // 对账周期性执行，只有带回变更才值得 INFO
+                log.info("批量对账返回变更, remote={}, changed={}, deleted={}",
+                        ctx.channel().remoteAddress(), changed.size(), deleted.size());
+            } else if (log.isDebugEnabled()) {
+                log.debug("批量对账无变更, remote={}, targets={}",
+                        ctx.channel().remoteAddress(), targets.size());
+            }
             RemotingCommand responseCommand = RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_OK, "ok");
             responseCommand.setBody(JsonUtils.toJson(response)

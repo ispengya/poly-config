@@ -1,11 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- 客户端测试与 ClientDemo 共用（logback 优先级：logback-test.xml > logback.xml）。
+     root=WARN 压制 netty 等第三方噪音；本项目日志放开到 INFO——
+     ClientDemo 的示例输出、客户端库的关键事件都能看到。 -->
 <configuration>
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
         </encoder>
     </appender>
 
+    <logger name="com.ispengya.polyconfig" level="INFO"/>
     <root level="WARN">
         <appender-ref ref="STDOUT"/>
     </root>

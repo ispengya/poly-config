@@ -2,13 +2,18 @@
 # poly-config 本地 AP 三节点集群 + 三客户端 启停脚本（测试用）
 #
 # 用法:
-#   scripts/ap-cluster.sh start      # 启动 3 个 server + 3 个 ClientDemo（已在运行的跳过）
+#   scripts/ap-cluster.sh up         # start + 立即实时跟随全部日志（Ctrl+C 只退出跟随，集群继续运行）
+#   scripts/ap-cluster.sh start      # 启动 3 个 server + 3 个 ClientDemo（已在运行的跳过），不跟日志
 #   scripts/ap-cluster.sh servers    # 只启动 3 个 server
 #   scripts/ap-cluster.sh clients    # 只启动 3 个 ClientDemo（各连一个节点）
 #   scripts/ap-cluster.sh stop       # 停止全部
 #   scripts/ap-cluster.sh status     # 查看进程与集群状态
 #   scripts/ap-cluster.sh logs [名]  # 实时跟随日志：不带名=全部6个，node-1/client-2=单个
 #   scripts/ap-cluster.sh clean      # 停止全部并清空本地数据与日志
+#
+# 日志说明: start 把每个进程的输出重定向到 logs/ap/<名>.out（6 个进程混在一个
+# 终端没法读，且 stop/status 依赖后台化）。发布/推送等日志都在文件里，想"边操作
+# 边看"就用 up 或 logs 跟随——start 自己的终端不会持续输出 server 日志。
 #
 # 节点与客户端布局（loopback）:
 #   server node-1  http 8848  remoting 9848  data/ap/node-1
@@ -17,8 +22,8 @@
 #   client-1 → 9848    client-2 → 9849    client-3 → 9850
 # 控制台: http://127.0.0.1:8848/ （8849/8850 同理，任意节点可管理全集群）
 #
-# 注意（AP-1 阶段语义）: 各节点尚无复制，写哪个节点就只在那个节点生效。
-# 例如在 node-1 控制台发布后，只有 client-1 会收到推送；AP-3 复制接入后全集群收敛。
+# 注意: mode=ap 全链路已通——写任意节点都会转发 owner 并异步复制到全体，
+# 连任意节点的客户端都会收到推送（例如在 node-1 发布，三个客户端都会收到）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -193,9 +198,19 @@ start() {
     start_clients
     echo
     echo "[done] 集群 + 客户端已启动"
-    echo "  控制台:  http://127.0.0.1:8848/  http://127.0.0.1:8849/  http://127.0.0.1:8850/"
-    echo "  客户端:  tail -f $LOG_ROOT/client-1.out"
-    echo "  停止:    scripts/ap-cluster.sh stop"
+    echo "  控制台:    http://127.0.0.1:8848/  http://127.0.0.1:8849/  http://127.0.0.1:8850/"
+    echo "  实时日志:  scripts/ap-cluster.sh logs        （全部 6 个进程）"
+    echo "             scripts/ap-cluster.sh logs node-1 （单个进程）"
+    echo "  停止:      scripts/ap-cluster.sh stop"
+}
+
+# start + 立即跟随全部日志：想"启动后边操作边看日志"就用这个。
+# Ctrl+C 只退出跟随，集群继续运行；停止用 stop。
+up() {
+    start
+    echo
+    echo "[up] 跟随实时日志中（Ctrl+C 仅退出跟随，集群继续运行）"
+    logs
 }
 
 logs() {
@@ -228,6 +243,7 @@ clean() {
 }
 
 case "${1:-start}" in
+    up)      up ;;
     start)   start ;;
     servers) mkdir -p "$LOG_ROOT"; build; start_servers ;;
     clients) mkdir -p "$LOG_ROOT"; build; start_clients ;;
@@ -236,7 +252,7 @@ case "${1:-start}" in
     logs)    logs "${2:-}" ;;
     clean)   clean ;;
     *)
-        echo "用法: $0 [start|servers|clients|stop|status|logs <node-1|client-2|...>|clean]" >&2
+        echo "用法: $0 [up|start|servers|clients|stop|status|logs <node-1|client-2|...>|clean]" >&2
         exit 1
         ;;
 esac

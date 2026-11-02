@@ -68,8 +68,11 @@ public class DistroSyncProcessor implements NettyRequestProcessor {
                     skipped++;
                 }
             }
-            if (log.isDebugEnabled()) {
-                log.debug("复制批次应用完成, applied={}, skipped={}", applied, skipped);
+            if (applied > 0) {
+                // 有实际变更才升 INFO：空转批次（重复/过期）保持安静
+                log.info("复制批次应用完成, applied={}, skipped={}", applied, skipped);
+            } else if (log.isDebugEnabled()) {
+                log.debug("复制批次应用完成, applied=0, skipped={}", skipped);
             }
             RemotingCommand response = RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_OK, "ok");

@@ -59,6 +59,8 @@ public class ChangePusher implements ChangeListener {
             RemotingCommand push = RemotingCommand.createPushCommand(
                     ProtocolCodes.PUSH_CONFIG_CHANGED);
             push.setBody(body);
+            log.debug("推送配置变更, key={}, version={}, channel={}",
+                    event.getKey(), event.getVersion(), channel);
             try {
                 ChannelFuture future = remotingServer.push(channel, push);
                 future.addListener(result -> {

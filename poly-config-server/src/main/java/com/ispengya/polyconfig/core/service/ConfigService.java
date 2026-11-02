@@ -13,6 +13,8 @@ import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.ClusterStatus;
 import com.ispengya.polyconfig.consistency.ConfigProtocol;
 import com.ispengya.polyconfig.consistency.ReadConsistency;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Optional;
@@ -23,6 +25,8 @@ import java.util.Optional;
  * <p>面向管理端提供发布、读取、删除、历史和回滚能力，不感知具体复制协议。</p>
  */
 public class ConfigService {
+
+    private static final Logger log = LoggerFactory.getLogger(ConfigService.class);
 
     /**
      * 一致性协议。
@@ -73,7 +77,10 @@ public class ConfigService {
         ConfigCommand command = new ConfigCommand(ConfigOperation.PUBLISH, key,
                 content == null ? "" : content, ConfigType.fromSupported(type),
                 normalizeOperator(operator), System.currentTimeMillis(), expectedVersion);
-        return protocol.propose(command);
+        MutationResult result = protocol.propose(command);
+        log.info("发布配置, key={}, version={}, operator={}",
+                key.toPath(), result.getVersion(), command.getOperator());
+        return result;
     }
 
     /**
@@ -118,7 +125,11 @@ public class ConfigService {
         if (!protocol.read(key, ReadConsistency.LOCAL).isPresent()) {
             throw new PolyConfigException(ErrorCode.NOT_FOUND, "配置不存在: " + key.toPath());
         }
-        return protocol.propose(ConfigCommand.delete(key, normalizeOperator(operator)));
+        ConfigCommand command = ConfigCommand.delete(key, normalizeOperator(operator));
+        MutationResult result = protocol.propose(command);
+        log.info("删除配置, key={}, version={}, operator={}",
+                key.toPath(), result.getVersion(), command.getOperator());
+        return result;
     }
 
     /**
@@ -161,6 +172,7 @@ public class ConfigService {
      */
     public void createNamespace(String namespace) {
         protocol.createNamespace(namespace);
+        log.info("创建命名空间, namespace={}", namespace);
     }
 
     /**
@@ -171,6 +183,7 @@ public class ConfigService {
      */
     public void createGroup(String namespace, String group) {
         protocol.createGroup(namespace, group);
+        log.info("创建分组, namespace={}, group={}", namespace, group);
     }
 
     /**
@@ -197,11 +210,16 @@ public class ConfigService {
             throw new PolyConfigException(ErrorCode.NOT_FOUND, "历史版本不存在: " + revision);
         }
         String normalizedOperator = normalizeOperator(operator);
+        MutationResult result;
         if (target.getOperation() == ConfigOperation.DELETE) {
-            return protocol.propose(ConfigCommand.delete(key, normalizedOperator));
+            result = protocol.propose(ConfigCommand.delete(key, normalizedOperator));
+        } else {
+            result = protocol.propose(ConfigCommand.rollback(key, target.getContent(),
+                    target.getType(), normalizedOperator));
         }
-        return protocol.propose(ConfigCommand.rollback(key, target.getContent(),
-                target.getType(), normalizedOperator));
+        log.info("回滚配置, key={}, targetRevision={}, version={}, operator={}",
+                key.toPath(), revision, result.getVersion(), normalizedOperator);
+        return result;
     }
 
     /**

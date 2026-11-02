@@ -59,10 +59,13 @@ public class SubscribeProcessor implements NettyRequestProcessor {
                     subscribe.getDataId());
             // 单连接订阅数上限
             if (!registry.subscribe(ctx.channel(), key)) {
+                log.warn("订阅数超出单连接上限, remote={}, key={}",
+                        ctx.channel().remoteAddress(), key);
                 return RemotingCommand.createResponseCommand(
                         ProtocolCodes.RESPONSE_BAD_REQUEST,
                         "订阅数超出单连接上限: " + key);
             }
+            log.info("订阅注册, remote={}, key={}", ctx.channel().remoteAddress(), key);
 
             Optional<ConfigEntry> entry = configService.get(key.getNamespace(),
                     key.getGroup(), key.getDataId());

@@ -3,6 +3,8 @@ package com.ispengya.polyconfig.client.demo;
 import com.ispengya.polyconfig.client.ClientOptions;
 import com.ispengya.polyconfig.client.PolyConfigClient;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Paths;
 import java.util.Objects;
@@ -30,6 +32,8 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class ClientDemo {
 
+    private static final Logger log = LoggerFactory.getLogger(ClientDemo.class);
+
     private static final String DEFAULT_SERVER = "127.0.0.1:9848";
     private static final String DEFAULT_NAMESPACE = "public";
     private static final String DEFAULT_GROUP = "DEFAULT_GROUP";
@@ -50,21 +54,14 @@ public final class ClientDemo {
      */
     public static void main(String[] args) throws Exception {
         Options options = Options.parse(args);
-        System.out.println("========================================");
-        System.out.println(" poly-config 示例应用：order-service");
-        System.out.println("========================================");
-        System.out.println("  servers  = " + String.join(",", options.servers));
-        System.out.println("  namespace= " + options.namespace);
-        System.out.println("  group    = " + options.group);
-        System.out.println("  dataId   = " + options.dataId);
-        System.out.println("  snapshot = " + options.snapshotDir);
-        System.out.println("----------------------------------------");
-        System.out.println(" 建议在控制台维护以下配置：");
-        System.out.println(" app:");
-        System.out.println("   greeting: hello");
-        System.out.println("   discount: false");
-        System.out.println("   timeoutMillis: 3000");
-        System.out.println("----------------------------------------");
+        log.info("========================================");
+        log.info("poly-config 示例应用：order-service");
+        log.info("servers={}, namespace={}, group={}, dataId={}",
+                String.join(",", options.servers), options.namespace,
+                options.group, options.dataId);
+        log.info("snapshot={}", options.snapshotDir);
+        log.info("建议在控制台维护: app.greeting=hello, app.discount=false, "
+                + "app.timeoutMillis=3000");
 
         ClientOptions clientOptions = ClientOptions.builder()
                 .servers(options.servers)
@@ -80,7 +77,7 @@ public final class ClientDemo {
         final CountDownLatch stop = new CountDownLatch(1);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("[app] 正在停止");
+            log.info("示例应用正在停止");
             client.close();
             stop.countDown();
         }, "client-demo-shutdown"));
@@ -89,7 +86,7 @@ public final class ClientDemo {
             String initial = client.getConfig(options.group, options.dataId, 3000L);
             apply(initial, settings, "启动加载");
         } catch (PolyConfigException e) {
-            System.out.println("[app] 服务端不可用，使用默认参数启动: " + e.getMessage());
+            log.warn("服务端不可用，使用默认参数启动: {}", e.getMessage());
         }
 
         client.addListener(options.group, options.dataId, (dataId, group, content) ->
@@ -102,16 +99,15 @@ public final class ClientDemo {
         });
         worker.scheduleWithFixedDelay(() -> {
             AppSettings current = settings.get();
-            System.out.println("[order-service] greeting=" + current.greeting
-                    + ", discount=" + current.discount
-                    + ", timeoutMillis=" + current.timeoutMillis);
+            log.info("[order-service] greeting={}, discount={}, timeoutMillis={}",
+                    current.greeting, current.discount, current.timeoutMillis);
         }, 5, 5, TimeUnit.SECONDS);
 
-        System.out.println("[app] 已启动，修改控制台配置可观察实时推送");
+        log.info("示例应用已启动，修改控制台配置可观察实时推送");
         if (options.runSeconds > 0) {
             stop.await(options.runSeconds, TimeUnit.SECONDS);
         } else {
-            System.out.println("[app] 按 Ctrl+C 退出");
+            log.info("按 Ctrl+C 退出");
             stop.await();
         }
 
@@ -123,17 +119,15 @@ public final class ClientDemo {
         if (content == null) {
             AppSettings defaults = AppSettings.defaults();
             settings.set(defaults);
-            System.out.println("[" + reason + "] 配置不存在，使用默认参数: " + defaults);
+            log.info("[{}] 配置不存在，使用默认参数: {}", reason, defaults);
             return;
         }
-        System.out.println("[" + reason + "] 收到配置内容:");
-        for (String line : content.split("\\r?\\n")) {
-            System.out.println("  " + line);
-        }
+        // 配置内容是数据块：作为消息体整体打印（仅首行带日志前缀）
+        log.info("[{}] 收到配置内容:\n{}", reason, content);
         AppSettings previous = settings.getAndSet(AppSettings.parse(content));
-        System.out.println("[" + reason + "] 生效参数: " + settings.get());
+        log.info("[{}] 生效参数: {}", reason, settings.get());
         if (!Objects.equals(previous, settings.get())) {
-            System.out.println("[" + reason + "] 参数已更新");
+            log.info("[{}] 参数已更新", reason);
         }
     }
 

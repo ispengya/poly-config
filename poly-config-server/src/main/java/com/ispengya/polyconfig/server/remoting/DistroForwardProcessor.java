@@ -75,6 +75,8 @@ public class DistroForwardProcessor implements NettyRequestProcessor {
             }
             ConfigCommand command = forward.toCommand();
             MutationResult result = engine.proposeLocal(command);
+            log.info("应用转发写入, key={}, version={}, operator={}",
+                    command.getKey().toPath(), result.getVersion(), command.getOperator());
             RemotingCommand response = RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_OK, "ok");
             response.setBody(JsonUtils.toJson(ForwardWriteResult.from(command, result))

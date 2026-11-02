@@ -217,6 +217,8 @@ public class DistroProtocol implements ConfigProtocol {
         try {
             response = remotingClient.invokeSync(address(owner), request, FORWARD_TIMEOUT_MILLIS);
         } catch (Exception e) {
+            log.warn("写转发失败, owner={}, key={}: {}",
+                    owner.getNodeId(), command.getKey().toPath(), e.toString());
             throw new PolyConfigException(ErrorCode.UNAVAILABLE,
                     "分区 owner 不可用: owner=" + owner.getNodeId()
                             + ", key=" + command.getKey(), e);
@@ -238,7 +240,10 @@ public class DistroProtocol implements ConfigProtocol {
             throw new PolyConfigException(ErrorCode.UNAVAILABLE, "写转发应答体非法");
         }
         // 按 owner 分配的版本同步 apply：写后即读 + 本地持久化
-        return engine.applyReplicated(toCommand(result));
+        MutationResult applied = engine.applyReplicated(toCommand(result));
+        log.debug("写转发完成, owner={}, key={}, version={}",
+                owner.getNodeId(), command.getKey().toPath(), applied.getVersion());
+        return applied;
     }
 
     /**

@@ -106,6 +106,8 @@ public class ConfigStateMachine implements StateMachine {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "不支持的配置操作: " + command.getOperation());
         }
+        log.debug("状态机应用, op={}, key={}, version={}, revision={}",
+                command.getOperation(), command.getKey().toPath(), version, revision);
         notifyListeners(event);
     }
 

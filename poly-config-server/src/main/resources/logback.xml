@@ -2,12 +2,13 @@
 <configuration>
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
             <!-- 显式 UTF-8：Windows 终端需 chcp 65001 或在 IDEA 控制台查看中文日志 -->
             <charset>UTF-8</charset>
         </encoder>
     </appender>
 
+    <!-- 按需对单包开 debug：<logger name="com.ispengya.polyconfig" level="DEBUG"/> -->
     <root level="INFO">
         <appender-ref ref="STDOUT"/>
     </root>

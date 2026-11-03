@@ -46,6 +46,12 @@ public final class ProtocolCodes {
     public static final int DISTRO_SYNC = 3003;
 
     /**
+     * AP 周期校验：副本向 owner 送分区摘要，应答体携带增量
+     * （DISTRO_PULL 的"应答 VERIFY"语义折叠在本协议的应答中）。
+     */
+    public static final int DISTRO_VERIFY = 3004;
+
+    /**
      * 响应成功。
      */
     public static final int RESPONSE_OK = 200;

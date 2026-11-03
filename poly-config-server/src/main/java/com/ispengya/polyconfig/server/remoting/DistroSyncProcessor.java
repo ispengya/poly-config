@@ -3,9 +3,6 @@ package com.ispengya.polyconfig.server.remoting;
 import com.ispengya.polyconfig.common.codec.CommandRecord;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
-import com.ispengya.polyconfig.common.model.ConfigCommand;
-import com.ispengya.polyconfig.common.model.ConfigEntry;
-import com.ispengya.polyconfig.common.model.ConfigOperation;
 import com.ispengya.polyconfig.common.protocol.DistroSyncRequest;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.util.JsonUtils;
@@ -17,7 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Optional;
 
 /**
  * AP 副本侧复制批次处理器（owner → 副本，3xxx 内部协议）。
@@ -62,7 +58,7 @@ public class DistroSyncProcessor implements NettyRequestProcessor {
             int applied = 0;
             int skipped = 0;
             for (CommandRecord record : sync.getCommands()) {
-                if (applyOne(record)) {
+                if (engine.applyReplicatedIfNewer(record)) {
                     applied++;
                 } else {
                     skipped++;
@@ -88,31 +84,6 @@ public class DistroSyncProcessor implements NettyRequestProcessor {
             return RemotingCommand.createResponseCommand(
                     ProtocolCodes.RESPONSE_SERVER_ERROR, "复制批次处理失败");
         }
-    }
-
-    /**
-     * 应用单条记录。
-     *
-     * @param record 命令记录（须携带 owner 分配的 version）
-     * @return 是否实际应用
-     */
-    private boolean applyOne(CommandRecord record) {
-        ConfigCommand command = record.toCommand();
-        Long version = command.getAssignedVersion();
-        if (version == null) {
-            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                    "复制命令缺少 owner 分配版本: " + command.getKey());
-        }
-        Optional<ConfigEntry> local = engine.read(command.getKey());
-        if (local.isPresent() && local.get().getVersion() >= version.longValue()) {
-            return false;
-        }
-        if (!local.isPresent() && command.getOperation() == ConfigOperation.DELETE) {
-            // 已删或从未存在：删除不改变现状，跳过保持幂等
-            return false;
-        }
-        engine.applyReplicated(command);
-        return true;
     }
 
     private static int toResponseCode(ErrorCode errorCode) {

@@ -7,8 +7,10 @@ import com.ispengya.polyconfig.common.model.ConfigCommand;
 import com.ispengya.polyconfig.common.model.ConfigConstants;
 import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.ConfigKey;
+import com.ispengya.polyconfig.common.model.ConfigOperation;
 import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
+import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.Md5Utils;
 import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.StateMachine;
@@ -240,6 +242,40 @@ public class ConfigStateMachine implements StateMachine {
      */
     public List<ConfigEntry> exportEntries() {
         return new ArrayList<>(current.values());
+    }
+
+    /**
+     * 导出周期校验摘要表：活条目 + 墓碑（docs/ap-design.md §6）。
+     *
+     * <p>墓碑 = 已不在当前表、且历史最新一条为 DELETE 的键；版本取该历史
+     * 条目的 revision——owner 本地分配路径 version = revision，即跨节点
+     * 权威版本。副本侧摘要里的墓碑版本只表达"已删除"，跨节点比较一律由
+     * owner 侧完成。</p>
+     *
+     * @return 摘要条目列表
+     */
+    public synchronized List<VerifyEntry> verifyTable() {
+        List<VerifyEntry> result = new ArrayList<>(current.size());
+        for (ConfigEntry entry : current.values()) {
+            ConfigKey key = entry.getKey();
+            result.add(new VerifyEntry(key.getNamespace(), key.getGroup(), key.getDataId(),
+                    entry.getVersion(), false));
+        }
+        for (Map.Entry<ConfigKey, Deque<HistoryEntry>> entry : histories.entrySet()) {
+            ConfigKey key = entry.getKey();
+            if (current.containsKey(key)) {
+                continue;
+            }
+            HistoryEntry head;
+            synchronized (entry.getValue()) {
+                head = entry.getValue().peekFirst();
+            }
+            if (head != null && head.getOperation() == ConfigOperation.DELETE) {
+                result.add(new VerifyEntry(key.getNamespace(), key.getGroup(), key.getDataId(),
+                        head.getRevision(), true));
+            }
+        }
+        return result;
     }
 
     /**

@@ -1,6 +1,7 @@
 package com.ispengya.polyconfig.core.engine;
 
 import com.ispengya.polyconfig.common.codec.CommandCodec;
+import com.ispengya.polyconfig.common.codec.CommandRecord;
 import com.ispengya.polyconfig.common.error.ErrorCode;
 import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.model.ConfigCommand;
@@ -11,6 +12,7 @@ import com.ispengya.polyconfig.common.model.ConfigOperation;
 import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import com.ispengya.polyconfig.common.model.MutationResult;
+import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.Md5Utils;
 import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.core.state.ConfigStateMachine;
@@ -286,6 +288,47 @@ public class LocalEngine {
             pendingWrites.add(pending);
         }
         return pending.await();
+    }
+
+    /**
+     * 副本侧幂等应用：比本地新才应用，否则丢弃（docs/ap-design.md §6）。
+     *
+     * <p>规则与 {@code DISTRO_SYNC} 批次一致：本地已有且 version 不小于
+     * 来值则丢弃（重复、乱序无害），本地没有且是删除也丢弃；否则走
+     * {@link #applyReplicated(ConfigCommand)} 落盘并触发本地推送。
+     * 复制批次与周期校验增量共用本入口。</p>
+     *
+     * @param record 命令记录（须携带 owner 分配的 version）
+     * @return 是否实际应用
+     */
+    public boolean applyReplicatedIfNewer(CommandRecord record) {
+        ensureOpen();
+        ConfigCommand command = record.toCommand();
+        Long version = command.getAssignedVersion();
+        if (version == null) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                    "复制命令缺少 owner 分配版本: " + command.getKey());
+        }
+        Optional<ConfigEntry> local = stateMachine.get(command.getKey());
+        if (local.isPresent() && local.get().getVersion() >= version.longValue()) {
+            return false;
+        }
+        if (!local.isPresent() && command.getOperation() == ConfigOperation.DELETE) {
+            // 已删或从未存在：删除不改变现状，跳过保持幂等
+            return false;
+        }
+        applyReplicated(command);
+        return true;
+    }
+
+    /**
+     * 导出周期校验摘要表（活条目 + 墓碑），供校验器发送。
+     *
+     * @return 摘要条目列表
+     */
+    public List<VerifyEntry> verifyTable() {
+        ensureOpen();
+        return stateMachine.verifyTable();
     }
 
     /**

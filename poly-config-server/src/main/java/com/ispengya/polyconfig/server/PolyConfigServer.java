@@ -14,6 +14,7 @@ import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.remoting.BatchSubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroForwardProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroSyncProcessor;
+import com.ispengya.polyconfig.server.remoting.DistroVerifyProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -144,6 +145,11 @@ public class PolyConfigServer {
             this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_SYNC,
                     new DistroSyncProcessor(((DistroProtocol) protocol).engine()),
                     remotingExecutor);
+            // 周期校验：每个节点都接收校验并只比对自己拥有的分区
+            this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_VERIFY,
+                    new DistroVerifyProcessor(((DistroProtocol) protocol).engine(),
+                            ((DistroProtocol) protocol).assignments(), options.getNodeId()),
+                    remotingExecutor);
         }
 
         this.changePusher = new ChangePusher(remotingServer, registry);
@@ -166,7 +172,8 @@ public class PolyConfigServer {
             case "ap":
                 return new DistroProtocol(options.getDataDir(), options.getNodeId(),
                         options.getClusterId(), options.getHistoryLimit(),
-                        options.getSnapshotThreshold(), options.getClusterMembers());
+                        options.getSnapshotThreshold(), options.getClusterMembers(),
+                        options.getVerifyIntervalMillis());
             case "cp":
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "CP 模式由 Raft 实现，尚未提供（M1 里程碑）");

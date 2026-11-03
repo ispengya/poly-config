@@ -80,6 +80,11 @@ public final class ServerOptions {
      */
     private final List<ClusterMember> clusterMembers;
 
+    /**
+     * AP 周期校验间隔（毫秒）；同时是复制缺口的收敛上界与探活频率。
+     */
+    private final long verifyIntervalMillis;
+
     private ServerOptions(Builder builder) {
         this.host = builder.host;
         this.advertiseHost = builder.advertiseHost;
@@ -94,6 +99,7 @@ public final class ServerOptions {
         this.maxBodyBytes = builder.maxBodyBytes;
         this.mode = builder.mode;
         this.clusterMembers = ClusterMember.parseList(builder.clusterMembers);
+        this.verifyIntervalMillis = builder.verifyIntervalMillis;
     }
 
     /**
@@ -111,7 +117,7 @@ public final class ServerOptions {
      * <p>支持 --host、--advertise-host、--http-port、--remoting-port、--data-dir、
      * --node-id、--cluster-id、--history-limit、--snapshot-threshold、
      * --max-subscriptions-per-connection、--max-body-bytes、--mode、
-     * --cluster-members。</p>
+     * --cluster-members、--verify-interval-ms。</p>
      *
      * @param args 命令行参数
      * @return 启动配置
@@ -171,6 +177,9 @@ public final class ServerOptions {
                     break;
                 case "cluster-members":
                     builder.clusterMembers(value);
+                    break;
+                case "verify-interval-ms":
+                    builder.verifyIntervalMillis(parseLongArg(key, value));
                     break;
                 default:
                     throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
@@ -285,6 +294,10 @@ public final class ServerOptions {
         return clusterMembers;
     }
 
+    public long getVerifyIntervalMillis() {
+        return verifyIntervalMillis;
+    }
+
     /**
      * 启动配置构造器。
      */
@@ -358,6 +371,11 @@ public final class ServerOptions {
          */
         private String clusterMembers = "";
 
+        /**
+         * AP 周期校验间隔（毫秒），默认 5 秒，最小 1 秒。
+         */
+        private long verifyIntervalMillis = 5_000L;
+
         public Builder host(String host) {
             this.host = host;
             return this;
@@ -423,6 +441,11 @@ public final class ServerOptions {
             return this;
         }
 
+        public Builder verifyIntervalMillis(long verifyIntervalMillis) {
+            this.verifyIntervalMillis = verifyIntervalMillis;
+            return this;
+        }
+
         public ServerOptions build() {
             if (host == null || host.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "host 不能为空");
@@ -458,6 +481,10 @@ public final class ServerOptions {
             if (maxBodyBytes <= 0) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "maxBodyBytes 必须大于 0");
+            }
+            if (verifyIntervalMillis < 1_000L) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "verifyIntervalMillis 不能小于 1000（毫秒）");
             }
             if (mode == null || mode.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "mode 不能为空");

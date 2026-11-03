@@ -59,7 +59,7 @@ public class DistroProtocolTest {
     public void shouldProposeReadAndReportApStatus() throws Exception {
         Path dataDir = folder.newFolder("ap-data").toPath();
         DistroProtocol protocol = new DistroProtocol(
-                dataDir, "node-1", "test-cluster", 100, 0, members());
+                dataDir, "node-1", "test-cluster", 100, 0, members(), 60_000L);
         try {
             protocol.setNodeAddress("127.0.0.1", 18848, 19848);
             protocol.start();
@@ -100,7 +100,7 @@ public class DistroProtocolTest {
             assertEquals(19849, peer.getRemotingPort());
             assertEquals(ProtocolMode.AP, peer.getMode());
             assertEquals(NodeRole.PEER, peer.getRole());
-            assertFalse("peer 端口无监听，探测不成功，健康位为 false", peer.isHealthy());
+            assertFalse("peer 端口无监听，校验无法送达，健康位为 false", peer.isHealthy());
         } finally {
             protocol.close();
         }
@@ -110,7 +110,7 @@ public class DistroProtocolTest {
     public void shouldPersistDataAcrossRestart() throws Exception {
         Path dataDir = folder.newFolder("ap-restart").toPath();
         DistroProtocol first = new DistroProtocol(
-                dataDir, "node-1", "test-cluster", 100, 0, members());
+                dataDir, "node-1", "test-cluster", 100, 0, members(), 60_000L);
         ConfigKey key = new ConfigKey("public", ownedGroup(first), "app.yml");
         try {
             first.propose(new ConfigCommand(
@@ -120,7 +120,7 @@ public class DistroProtocolTest {
             first.close();
         }
         DistroProtocol second = new DistroProtocol(
-                dataDir, "node-1", "test-cluster", 100, 0, members());
+                dataDir, "node-1", "test-cluster", 100, 0, members(), 60_000L);
         try {
             assertEquals("v1", second.read(key, ReadConsistency.LOCAL).get().getContent());
             assertEquals(ProtocolMode.AP, second.status().getMode());
@@ -129,35 +129,14 @@ public class DistroProtocolTest {
         }
     }
 
-    @Test
-    public void shouldMarkPeerHealthyWhenPeerListening() throws Exception {
-        Path dataDir = folder.newFolder("ap-probe").toPath();
-        // 在 node-2 的长连接端口上挂一个纯 TCP 监听，模拟"节点在线"
-        java.net.ServerSocket peerSocket = new java.net.ServerSocket(19849);
-        DistroProtocol protocol = new DistroProtocol(
-                dataDir, "node-1", "test-cluster", 100, 0, members());
-        try {
-            protocol.start();
-            long deadline = System.currentTimeMillis() + 7000L;
-            boolean healthy = false;
-            while (System.currentTimeMillis() < deadline && !healthy) {
-                healthy = protocol.clusterStatus().getNodes().get(1).isHealthy();
-                if (!healthy) {
-                    Thread.sleep(100L);
-                }
-            }
-            assertTrue("探测到 peer 在线后健康位应点亮", healthy);
-        } finally {
-            protocol.close();
-            peerSocket.close();
-        }
-    }
+    // 健康位原由纯展示 TCP 探测点亮（纯 TCP 监听即可），校验接入后改为
+    // "最近一次复制/校验成功"——需要真实对端应答，覆盖移到 ApVerifyIntegrationTest
 
     @Test
     public void shouldRejectConstructionWhenSelfNotInMembers() throws Exception {
         Path dataDir = folder.newFolder("ap-noself").toPath();
         try {
-            new DistroProtocol(dataDir, "node-9", "test-cluster", 100, 0, members());
+            new DistroProtocol(dataDir, "node-9", "test-cluster", 100, 0, members(), 60_000L);
             fail("本节点不在成员列表中应被拒绝");
         } catch (PolyConfigException expected) {
             assertTrue("错误信息应包含节点 ID: " + expected.getMessage(),

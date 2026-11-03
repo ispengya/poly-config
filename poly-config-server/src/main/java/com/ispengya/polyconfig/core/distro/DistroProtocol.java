@@ -31,19 +31,12 @@ import com.ispengya.remoting.protocol.RemotingCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * AP（Distro）协议实现。
@@ -57,25 +50,18 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 默认 {@code LOCAL} 读本地副本。</p>
  *
  * <p>异步复制：owner 本地写刷盘后入 {@link DistroReplicator} 攒批，
- * {@code DISTRO_SYNC} 推送其余副本；副本幂等 apply 并触发本地推送。
- * 校验/反熵（AP-4）尚未接入，落后副本靠校验补齐。</p>
+ * {@code DISTRO_SYNC} 推送其余副本；副本幂等 apply 并触发本地推送。</p>
+ *
+ * <p>周期校验/反熵：{@link DistroVerifier} 每轮向全体成员送分区摘要
+ * （含墓碑），应答增量按幂等规则应用——补齐复制失败/宕机期间的缺口，
+ * 同时充当探活（健康位 = 最近一次复制/校验成功，纯展示 TCP 探测已移除）。</p>
  */
 public class DistroProtocol implements ConfigProtocol {
 
     private static final Logger log = LoggerFactory.getLogger(DistroProtocol.class);
 
     /**
-     * 成员探测周期；仅用于状态页展示。
-     */
-    private static final long PROBE_INTERVAL_MILLIS = 5_000L;
-
-    /**
-     * 单次探测连接超时。
-     */
-    private static final long PROBE_TIMEOUT_MILLIS = 1_000L;
-
-    /**
-     * 健康判定窗口：最近一次探测成功距今超过该值视为不健康（3 个探测周期）。
+     * 健康判定窗口：最近一次复制/校验成功距今超过该值视为不健康（3 个周期）。
      */
     private static final long HEALTH_WINDOW_MILLIS = 15_000L;
 
@@ -103,6 +89,11 @@ public class DistroProtocol implements ConfigProtocol {
      * owner 侧异步复制器（本地写刷盘后攒批推送其余副本）。
      */
     private final DistroReplicator replicator;
+
+    /**
+     * 周期校验器（分区摘要比对 + 增量补齐 + 探活）。
+     */
+    private final DistroVerifier verifier;
 
     /**
      * 节点 ID。
@@ -135,14 +126,9 @@ public class DistroProtocol implements ConfigProtocol {
     private volatile boolean closed;
 
     /**
-     * peer 最近一次探测成功时间（nodeId → epoch millis），仅喂状态页。
+     * peer 最近一次复制/校验交互成功时间（nodeId → epoch millis），喂状态页健康位。
      */
     private final ConcurrentHashMap<String, Long> peerLastSeen = new ConcurrentHashMap<>();
-
-    /**
-     * 成员探测线程（纯展示用途，AP-4 校验接入后由校验结果取代）。
-     */
-    private final ScheduledExecutorService probeExecutor;
 
     /**
      * 创建 Distro 协议并恢复状态。
@@ -153,9 +139,11 @@ public class DistroProtocol implements ConfigProtocol {
      * @param historyLimit 历史保留条数
      * @param snapshotThreshold 快照触发阈值（命令条数），0 表示关闭快照
      * @param members 静态成员列表，不可为空且必须包含本节点
+     * @param verifyIntervalMillis 校验周期（毫秒），决定收敛上界与探活频率
      */
     public DistroProtocol(Path dataDir, String nodeId, String clusterId, int historyLimit,
-                          int snapshotThreshold, List<ClusterMember> members) {
+                          int snapshotThreshold, List<ClusterMember> members,
+                          long verifyIntervalMillis) {
         this.assignments = new DistroAssignments(members);
         this.nodeId = nodeId;
         this.clusterId = clusterId;
@@ -165,23 +153,21 @@ public class DistroProtocol implements ConfigProtocol {
         this.remotingClient = new NettyRemotingClient();
         this.replicator = new DistroReplicator(assignments, nodeId, remotingClient,
                 peerNodeId -> peerLastSeen.put(peerNodeId, System.currentTimeMillis()));
+        this.verifier = new DistroVerifier(assignments, nodeId, engine, remotingClient,
+                verifyIntervalMillis,
+                peerNodeId -> peerLastSeen.put(peerNodeId, System.currentTimeMillis()));
         // 只有本地分配路径（owner）触发复制；副本 applyReplicated 不再向外复制
         this.engine.setProposeListener(replicator::enqueue);
-        this.probeExecutor =
-                Executors.newSingleThreadScheduledExecutor(daemonFactory("poly-config-probe"));
     }
 
     @Override
     public void start() {
         remotingClient.start();
         replicator.start();
+        verifier.start();
         List<ClusterMember> members = assignments.members();
         log.info("DistroProtocol started, nodeId={}, clusterId={}, members={}, 本节点负责分区占比≈1/{}",
                 nodeId, clusterId, members, members.size());
-        if (members.size() > 1) {
-            probeExecutor.scheduleWithFixedDelay(this::probePeers,
-                    1_000L, PROBE_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-        }
     }
 
     @Override
@@ -368,37 +354,7 @@ public class DistroProtocol implements ConfigProtocol {
     }
 
     /**
-     * 探测全部 peer 的长连接端口，刷新状态页健康位。
-     *
-     * <p><b>纯展示用途</b>：探测结果不参与任何协议决策（写转发、复制、校验
-     * 各自按自己的交互判断对端状态）。AP-4 校验接入后，健康位改由"最近一次
-     * 校验/复制成功时间"点亮，本探测线程随之移除。</p>
-     *
-     * <p>整体捕获异常：{@code scheduleWithFixedDelay} 在任务抛出时会取消
-     * 后续执行，探测失败绝不能中断调度。</p>
-     */
-    private void probePeers() {
-        try {
-            long now = System.currentTimeMillis();
-            for (ClusterMember member : assignments.members()) {
-                if (member.getNodeId().equals(nodeId)) {
-                    continue;
-                }
-                try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(member.getHost(),
-                            member.getRemotingPort()), (int) PROBE_TIMEOUT_MILLIS);
-                    peerLastSeen.put(member.getNodeId(), now);
-                } catch (Exception ignored) {
-                    // 不可达：保持旧时间戳，超过健康窗口后自然转为不健康
-                }
-            }
-        } catch (RuntimeException e) {
-            log.debug("成员探测轮次异常", e);
-        }
-    }
-
-    /**
-     * 判断 peer 健康位（仅展示）：窗口内探测成功过即健康。
+     * 判断 peer 健康位（仅展示）：窗口内有过成功的复制/校验交互即健康。
      *
      * @param peerNodeId peer 节点 ID
      * @return 是否健康
@@ -427,7 +383,7 @@ public class DistroProtocol implements ConfigProtocol {
             }
             closed = true;
         }
-        probeExecutor.shutdownNow();
+        verifier.close();
         replicator.close();
         try {
             remotingClient.shutdown();
@@ -474,14 +430,5 @@ public class DistroProtocol implements ConfigProtocol {
             return new String(response.getBody(), StandardCharsets.UTF_8);
         }
         return "code=" + response.getCode();
-    }
-
-    private static ThreadFactory daemonFactory(String prefix) {
-        AtomicInteger index = new AtomicInteger();
-        return runnable -> {
-            Thread thread = new Thread(runnable, prefix + "-" + index.incrementAndGet());
-            thread.setDaemon(true);
-            return thread;
-        };
     }
 }

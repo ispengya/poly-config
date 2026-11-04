@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -84,6 +85,11 @@ public class DistroVerifier {
      * 校验调度线程。
      */
     private final ScheduledExecutorService scheduler;
+
+    /**
+     * 每个 peer 的最近校验统计（状态采集用，nodeId → 统计）。
+     */
+    private final ConcurrentHashMap<String, VerifyStat> stats = new ConcurrentHashMap<>();
 
     /**
      * 是否已关闭。
@@ -190,6 +196,8 @@ public class DistroVerifier {
         }
         // 应答成功即证明对端存活：点亮健康位（探活寄生在校验上，§6）
         onPeerAlive.accept(peer.getNodeId());
+        VerifyStat stat = stats.computeIfAbsent(peer.getNodeId(), id -> new VerifyStat());
+        stat.lastVerify = System.currentTimeMillis();
         int applied = 0;
         int skipped = 0;
         if (response.getBody() != null && response.getBody().length > 0) {
@@ -206,10 +214,45 @@ public class DistroVerifier {
                 }
             }
         }
+        stat.lastDelta = applied;
         if (applied > 0) {
             log.info("校验补齐, peer={}, applied={}, skipped={}", peer.getNodeId(), applied, skipped);
         } else if (log.isDebugEnabled()) {
             log.debug("校验一致, peer={}, entries={}", peer.getNodeId(), entries.size());
+        }
+    }
+
+    /**
+     * 查询单个 peer 的最近校验统计（状态采集用）。
+     *
+     * @param nodeId peer 节点 ID
+     * @return 统计；从未校验成功过返回 {@code null}
+     */
+    public VerifyStat statOf(String nodeId) {
+        return stats.get(nodeId);
+    }
+
+    /**
+     * 单个 peer 的最近校验统计：成功时间 + 上次实际补齐条数。
+     */
+    public static final class VerifyStat {
+
+        /**
+         * 最近一次校验成功时间（epoch millis）。
+         */
+        private volatile long lastVerify;
+
+        /**
+         * 最近一次校验实际补齐的条数（0 表示已对齐）。
+         */
+        private volatile long lastDelta;
+
+        public long getLastVerify() {
+            return lastVerify;
+        }
+
+        public long getLastDelta() {
+            return lastDelta;
         }
     }
 

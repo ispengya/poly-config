@@ -887,6 +887,26 @@ const app = createApp({
             }
             return '·';
         },
+        detailOf(nodeId) {
+            const list = this.cluster.details || [];
+            return list.find(detail => detail.nodeId === nodeId) || null;
+        },
+        ago(timestamp) {
+            if (!timestamp) {
+                return '从未';
+            }
+            const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+            if (seconds < 5) {
+                return '刚刚';
+            }
+            if (seconds < 60) {
+                return seconds + 's前';
+            }
+            if (seconds < 3600) {
+                return Math.round(seconds / 60) + 'm前';
+            }
+            return Math.round(seconds / 3600) + 'h前';
+        },
         nodeTitle(node) {
             return (node.nodeId || '')
                 + ' · ' + (node.role || '—')

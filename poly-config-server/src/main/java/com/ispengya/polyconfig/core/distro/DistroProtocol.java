@@ -15,12 +15,14 @@ import com.ispengya.polyconfig.common.protocol.ForwardReadRequest;
 import com.ispengya.polyconfig.common.protocol.ForwardWriteRequest;
 import com.ispengya.polyconfig.common.protocol.ForwardWriteResult;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
+import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.common.util.Preconditions;
 import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.ClusterMember;
 import com.ispengya.polyconfig.consistency.ClusterStatus;
 import com.ispengya.polyconfig.consistency.ConfigProtocol;
+import com.ispengya.polyconfig.consistency.NodeDetail;
 import com.ispengya.polyconfig.consistency.NodeRole;
 import com.ispengya.polyconfig.consistency.NodeStatus;
 import com.ispengya.polyconfig.consistency.ProtocolMode;
@@ -36,6 +38,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -64,6 +68,11 @@ public class DistroProtocol implements ConfigProtocol {
      * 健康判定窗口：最近一次复制/校验成功距今超过该值视为不健康（3 个周期）。
      */
     private static final long HEALTH_WINDOW_MILLIS = 15_000L;
+
+    /**
+     * 状态采集单次调用超时（控制台刷新不被慢对端拖死）。
+     */
+    private static final long STATUS_TIMEOUT_MILLIS = 500L;
 
     /**
      * 转发请求超时。
@@ -129,6 +138,11 @@ public class DistroProtocol implements ConfigProtocol {
      * peer 最近一次复制/校验交互成功时间（nodeId → epoch millis），喂状态页健康位。
      */
     private final ConcurrentHashMap<String, Long> peerLastSeen = new ConcurrentHashMap<>();
+
+    /**
+     * 校验异常统计（校验处理器写入，状态采集读出）。
+     */
+    private final VerifyAnomalyStats anomalyStats = new VerifyAnomalyStats();
 
     /**
      * 创建 Distro 协议并恢复状态。
@@ -339,18 +353,151 @@ public class DistroProtocol implements ConfigProtocol {
 
     @Override
     public ClusterStatus clusterStatus() {
+        List<ClusterMember> members = assignments.members();
         List<NodeStatus> nodes = new ArrayList<>();
-        for (ClusterMember member : assignments.members()) {
+        for (ClusterMember member : members) {
             if (member.getNodeId().equals(nodeId)) {
                 nodes.add(status());
             } else {
                 nodes.add(new NodeStatus(member.getNodeId(), member.getHost(),
                         member.getHttpPort(), member.getRemotingPort(),
                         ProtocolMode.AP, NodeRole.PEER, isPeerHealthy(member.getNodeId()),
-                        0L, "", assignments.members().size()));
+                        0L, "", members.size()));
             }
         }
-        return new ClusterStatus(clusterId, nodeId, ProtocolMode.AP, nodes);
+        ClusterStatus result = new ClusterStatus(clusterId, nodeId, ProtocolMode.AP, nodes);
+        // 内部通道第四种用途（设计 §4）：向全体成员采集详细状态后聚合；
+        // 对端不可达降级为静态信息，不阻塞控制台
+        result.setDetails(collectDetails(members));
+        return result;
+    }
+
+    /**
+     * 向全体成员采集详细状态（按成员顺序）；本节点本地构建，对端走
+     * {@code DISTRO_STATUS}，失败降级为静态详情。
+     *
+     * @param members 成员列表
+     * @return 详细状态列表
+     */
+    private List<NodeDetail> collectDetails(List<ClusterMember> members) {
+        List<NodeDetail> details = new ArrayList<>(members.size());
+        for (ClusterMember member : members) {
+            if (member.getNodeId().equals(nodeId)) {
+                try {
+                    details.add(localDetail());
+                } catch (RuntimeException e) {
+                    log.debug("本地详细状态构建失败", e);
+                    details.add(staticDetail(member));
+                }
+                continue;
+            }
+            try {
+                RemotingCommand request = RemotingCommand.createRequestCommand(
+                        ProtocolCodes.DISTRO_STATUS, null);
+                RemotingCommand response = remotingClient.invokeSync(
+                        address(member), request, STATUS_TIMEOUT_MILLIS);
+                if (response.getCode() == ProtocolCodes.RESPONSE_OK
+                        && response.getBody() != null && response.getBody().length > 0) {
+                    NodeDetail detail = JsonUtils.parseObject(
+                            new String(response.getBody(), StandardCharsets.UTF_8),
+                            NodeDetail.class);
+                    if (detail != null && detail.getNodeId() != null) {
+                        details.add(detail);
+                        continue;
+                    }
+                }
+                details.add(staticDetail(member));
+            } catch (Exception e) {
+                log.debug("状态采集失败, peer={}: {}", member.getNodeId(), e.toString());
+                details.add(staticDetail(member));
+            }
+        }
+        return details;
+    }
+
+    /**
+     * 本节点的详细状态（自报视图：分区归属、校验/健康时间、异常统计）。
+     *
+     * @return 详细状态
+     */
+    public NodeDetail localDetail() {
+        NodeDetail detail = new NodeDetail();
+        detail.setNodeId(nodeId);
+        detail.setHost(host);
+        detail.setPort(httpPort);
+        detail.setRemotingPort(remotingPort);
+        detail.setMode(ProtocolMode.AP);
+        detail.setRole(NodeRole.PEER);
+        detail.setHealthy(!closed);
+        detail.setMemberCount(assignments.members().size());
+        detail.setCurrentRevision(engine.currentRevision());
+        detail.setOwnedPartitions(ownedPartitions());
+        detail.setAnomalyCount(anomalyStats.getCount());
+        detail.setLastAnomalyTime(anomalyStats.getLastTime());
+        detail.setLastAnomaly(anomalyStats.getLastDetail());
+        List<NodeDetail.PeerView> views = new ArrayList<>();
+        for (ClusterMember member : assignments.members()) {
+            if (member.getNodeId().equals(nodeId)) {
+                continue;
+            }
+            NodeDetail.PeerView view = new NodeDetail.PeerView();
+            view.setNodeId(member.getNodeId());
+            Long seen = peerLastSeen.get(member.getNodeId());
+            view.setLastSeen(seen == null ? 0L : seen);
+            DistroVerifier.VerifyStat stat = verifier.statOf(member.getNodeId());
+            if (stat != null) {
+                view.setLastVerify(stat.getLastVerify());
+                view.setLastDeltaCount(stat.getLastDelta());
+            }
+            views.add(view);
+        }
+        detail.setPeers(views);
+        return detail;
+    }
+
+    /**
+     * 本节点拥有的分区（现有分区按归属过滤，{@code namespace/group} 有序去重）。
+     *
+     * @return 分区列表
+     */
+    private List<String> ownedPartitions() {
+        Set<String> result = new TreeSet<>();
+        for (VerifyEntry entry : engine.verifyTable()) {
+            ConfigKey key = new ConfigKey(entry.getNamespace(), entry.getGroup(),
+                    entry.getDataId());
+            if (assignments.ownerOf(key).getNodeId().equals(nodeId)) {
+                result.add(key.getNamespace() + "/" + key.getGroup());
+            }
+        }
+        return new ArrayList<>(result);
+    }
+
+    /**
+     * 采集失败时的静态降级详情（只有身份信息与健康位，统计留空）。
+     *
+     * @param member 成员
+     * @return 静态详情
+     */
+    private NodeDetail staticDetail(ClusterMember member) {
+        NodeDetail detail = new NodeDetail();
+        detail.setNodeId(member.getNodeId());
+        detail.setHost(member.getHost());
+        detail.setPort(member.getHttpPort());
+        detail.setRemotingPort(member.getRemotingPort());
+        detail.setMode(ProtocolMode.AP);
+        detail.setRole(NodeRole.PEER);
+        detail.setHealthy(isPeerHealthy(member.getNodeId()));
+        detail.setMemberCount(assignments.members().size());
+        return detail;
+    }
+
+    /**
+     * 校验异常统计（状态采集读出）。
+     *
+     * @return 异常统计
+     */
+    public VerifyAnomalyStats anomalyStats() {
+        return anomalyStats;
     }
 
     /**

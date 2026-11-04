@@ -13,6 +13,7 @@ import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.core.distro.DistroAssignments;
+import com.ispengya.polyconfig.core.distro.VerifyAnomalyStats;
 import com.ispengya.polyconfig.core.engine.LocalEngine;
 import com.ispengya.remoting.netty.NettyRequestProcessor;
 import com.ispengya.remoting.protocol.RemotingCommand;
@@ -76,17 +77,24 @@ public class DistroVerifyProcessor implements NettyRequestProcessor {
     private final String selfNodeId;
 
     /**
+     * 校验异常统计（状态接口/控制台展示用）。
+     */
+    private final VerifyAnomalyStats anomalyStats;
+
+    /**
      * 创建校验处理器。
      *
      * @param engine 本地存储引擎
      * @param assignments 分区归属表
      * @param selfNodeId 本节点 ID
+     * @param anomalyStats 校验异常统计
      */
     public DistroVerifyProcessor(LocalEngine engine, DistroAssignments assignments,
-                                 String selfNodeId) {
+                                 String selfNodeId, VerifyAnomalyStats anomalyStats) {
         this.engine = engine;
         this.assignments = assignments;
         this.selfNodeId = selfNodeId;
+        this.anomalyStats = anomalyStats;
     }
 
     @Override
@@ -143,9 +151,13 @@ public class DistroVerifyProcessor implements NettyRequestProcessor {
             // 副本表中本节点从未有过的键：owner 是唯一写入口，出现即异常
             for (Map.Entry<ConfigKey, VerifyEntry> entry : theirs.entrySet()) {
                 if (!own.containsKey(entry.getKey()) && !entry.getValue().isDeleted()) {
+                    String detail = "副本" + verify.getSourceNodeId()
+                            + " 持有从未有过的键 " + entry.getKey().toPath()
+                            + " (version=" + entry.getValue().getVersion() + ")";
                     log.warn("校验异常: 副本持有本节点从未有过的键, replica={}, key={}, version={}",
                             verify.getSourceNodeId(), entry.getKey().toPath(),
                             entry.getValue().getVersion());
+                    anomalyStats.record(detail);
                 }
             }
             RemotingCommand response = RemotingCommand.createResponseCommand(
@@ -190,6 +202,9 @@ public class DistroVerifyProcessor implements NettyRequestProcessor {
             log.warn("校验异常: 副本版本不小于 owner 墓碑, replica={}, key={}, "
                             + "replicaVersion={}, ownerVersion={}",
                     replicaId, key.toPath(), theirs.getVersion(), mine.getVersion());
+            anomalyStats.record("副本" + replicaId + " 版本不小于 owner 墓碑 "
+                    + key.toPath() + " (replica=" + theirs.getVersion()
+                    + ", owner=" + mine.getVersion() + ")");
             return null;
         }
         // owner 持有活条目
@@ -204,6 +219,9 @@ public class DistroVerifyProcessor implements NettyRequestProcessor {
             log.warn("校验异常: 副本版本反超 owner, replica={}, key={}, "
                             + "replicaVersion={}, ownerVersion={}",
                     replicaId, key.toPath(), theirs.getVersion(), mine.getVersion());
+            anomalyStats.record("副本" + replicaId + " 版本反超 owner "
+                    + key.toPath() + " (replica=" + theirs.getVersion()
+                    + ", owner=" + mine.getVersion() + ")");
             return null;
         }
         if (theirs.getVersion() < mine.getVersion()) {

@@ -52,6 +52,12 @@ public final class ProtocolCodes {
     public static final int DISTRO_VERIFY = 3004;
 
     /**
+     * AP 状态采集：控制台所在节点向全体成员收集详细状态后聚合
+     * （内部通道第四种用途：状态采集）。
+     */
+    public static final int DISTRO_STATUS = 3005;
+
+    /**
      * 响应成功。
      */
     public static final int RESPONSE_OK = 200;

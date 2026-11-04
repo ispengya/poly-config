@@ -32,6 +32,13 @@ public final class ClusterStatus {
     private final List<NodeStatus> nodes;
 
     /**
+     * 成员详细状态（AP 状态采集后填充，按成员顺序；standalone 为 null）。
+     *
+     * <p>控制台优先用它渲染分区/校验/异常列，取不到时回退 {@link #nodes}。</p>
+     */
+    private List<NodeDetail> details;
+
+    /**
      * 创建集群状态。
      *
      * @param clusterId 集群 ID
@@ -63,5 +70,13 @@ public final class ClusterStatus {
 
     public List<NodeStatus> getNodes() {
         return nodes;
+    }
+
+    public List<NodeDetail> getDetails() {
+        return details;
+    }
+
+    public void setDetails(List<NodeDetail> details) {
+        this.details = details;
     }
 }

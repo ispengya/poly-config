@@ -350,6 +350,39 @@
                             <dt>Leader</dt>
                             <dd>{{ node.leaderId || '—' }}</dd>
                         </dl>
+                        <div class="node-detail" v-if="detailOf(node.nodeId)">
+                            <div class="detail-row">
+                                <span class="k">分区</span>
+                                <span class="partitions">
+                                    <template v-if="(detailOf(node.nodeId).ownedPartitions || []).length">
+                                        <em v-for="p in detailOf(node.nodeId).ownedPartitions"
+                                            :key="p" class="mono">{{ p }}</em>
+                                    </template>
+                                    <span v-else class="none">不持有</span>
+                                </span>
+                            </div>
+                            <div class="detail-row">
+                                <span class="k">校验</span>
+                                <span class="verify-list">
+                                    <em v-for="p in detailOf(node.nodeId).peers || []" :key="p.nodeId"
+                                        class="mono"
+                                        :title="'最近交互 ' + ago(p.lastSeen)">
+                                        ↔ {{ p.nodeId }} {{ ago(p.lastVerify) }}<b
+                                            v-if="p.lastDeltaCount"> · 补{{ p.lastDeltaCount }}条</b>
+                                    </em>
+                                    <span v-if="!(detailOf(node.nodeId).peers || []).length"
+                                          class="none">单成员</span>
+                                </span>
+                            </div>
+                            <div class="detail-row" v-if="detailOf(node.nodeId).anomalyCount">
+                                <span class="k">异常</span>
+                                <span class="anomaly"
+                                      :title="detailOf(node.nodeId).lastAnomaly + ' · ' + ago(detailOf(node.nodeId).lastAnomalyTime)">
+                                    {{ detailOf(node.nodeId).anomalyCount }} 次 ·
+                                    {{ detailOf(node.nodeId).lastAnomaly }}
+                                </span>
+                            </div>
+                        </div>
                     </article>
 
                     <div v-if="!(cluster.nodes || []).length" class="empty">

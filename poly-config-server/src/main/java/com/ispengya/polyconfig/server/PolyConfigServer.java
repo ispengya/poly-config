@@ -13,6 +13,7 @@ import com.ispengya.polyconfig.server.push.ChangePusher;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.remoting.BatchSubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroForwardProcessor;
+import com.ispengya.polyconfig.server.remoting.DistroStatusProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroSyncProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroVerifyProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
@@ -148,7 +149,12 @@ public class PolyConfigServer {
             // 周期校验：每个节点都接收校验并只比对自己拥有的分区
             this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_VERIFY,
                     new DistroVerifyProcessor(((DistroProtocol) protocol).engine(),
-                            ((DistroProtocol) protocol).assignments(), options.getNodeId()),
+                            ((DistroProtocol) protocol).assignments(), options.getNodeId(),
+                            ((DistroProtocol) protocol).anomalyStats()),
+                    remotingExecutor);
+            // 状态采集：控制台所在节点向全体成员收集详细状态（设计 §4）
+            this.remotingServer.registerProcessor(ProtocolCodes.DISTRO_STATUS,
+                    new DistroStatusProcessor(((DistroProtocol) protocol)::localDetail),
                     remotingExecutor);
         }
 

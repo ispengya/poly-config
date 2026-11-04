@@ -12,6 +12,7 @@ import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.consistency.ClusterMember;
 import com.ispengya.polyconfig.core.distro.DistroAssignments;
+import com.ispengya.polyconfig.core.distro.VerifyAnomalyStats;
 import com.ispengya.polyconfig.core.engine.LocalEngine;
 import com.ispengya.remoting.protocol.RemotingCommand;
 import org.junit.After;
@@ -47,13 +48,15 @@ public class DistroVerifyProcessorTest {
     private LocalEngine engine;
     private DistroVerifyProcessor processor;
     private DistroAssignments assignments;
+    private VerifyAnomalyStats anomalyStats;
 
     @Before
     public void setUp() throws Exception {
         Path dataDir = folder.newFolder("verify-engine").toPath();
         engine = new LocalEngine(dataDir, "node-1", "verify-test", 100, 0);
         assignments = new DistroAssignments(MEMBERS);
-        processor = new DistroVerifyProcessor(engine, assignments, "node-1");
+        anomalyStats = new VerifyAnomalyStats();
+        processor = new DistroVerifyProcessor(engine, assignments, "node-1", anomalyStats);
     }
 
     @After
@@ -137,6 +140,9 @@ public class DistroVerifyProcessorTest {
                 entry(group, "app.yml", 1L, false),
                 entry(group, "ghost.yml", 7L, false)));
         assertTrue("owner 没有的键不应下发任何数据", delta.isEmpty());
+        assertEquals("异常应计入统计供状态接口展示", 1, anomalyStats.getCount());
+        assertTrue("异常详情应包含键路径",
+                anomalyStats.getLastDetail().contains("ghost.yml"));
     }
 
     @Test

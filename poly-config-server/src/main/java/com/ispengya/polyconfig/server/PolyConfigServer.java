@@ -6,6 +6,8 @@ import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
 import com.ispengya.polyconfig.common.util.NetworkUtils;
 import com.ispengya.polyconfig.consistency.ConfigProtocol;
 import com.ispengya.polyconfig.core.distro.DistroProtocol;
+import com.ispengya.polyconfig.core.raft.RaftNode;
+import com.ispengya.polyconfig.core.raft.RaftProtocol;
 import com.ispengya.polyconfig.core.service.ConfigService;
 import com.ispengya.polyconfig.server.http.ApiHandler;
 import com.ispengya.polyconfig.server.http.StaticFileHandler;
@@ -17,6 +19,8 @@ import com.ispengya.polyconfig.server.remoting.DistroStatusProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroSyncProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroVerifyProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftAppendProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftVoteProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
 import com.ispengya.polyconfig.core.standalone.LocalProtocol;
@@ -157,6 +161,14 @@ public class PolyConfigServer {
                     new DistroStatusProcessor(((DistroProtocol) protocol)::localDetail),
                     remotingExecutor);
         }
+        if (protocol instanceof RaftProtocol) {
+            // CP 内部协议（4xxx）：拉票与复制/心跳，消息一律进 RaftNode 单线程信箱
+            RaftNode raftNode = ((RaftProtocol) protocol).raftNode();
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_VOTE,
+                    new RaftVoteProcessor(raftNode), remotingExecutor);
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_APPEND,
+                    new RaftAppendProcessor(raftNode), remotingExecutor);
+        }
 
         this.changePusher = new ChangePusher(remotingServer, registry);
         this.configService.addChangeListener(changePusher);
@@ -181,8 +193,11 @@ public class PolyConfigServer {
                         options.getSnapshotThreshold(), options.getClusterMembers(),
                         options.getVerifyIntervalMillis());
             case "cp":
-                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                        "CP 模式由 Raft 实现，尚未提供（M1 里程碑）");
+                return new RaftProtocol(options.getDataDir(), options.getNodeId(),
+                        options.getClusterId(), options.getHistoryLimit(),
+                        options.getSnapshotThreshold(), options.getClusterMembers(),
+                        options.getRaftElectionTimeoutMillis(),
+                        options.getRaftHeartbeatMillis());
             default:
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "未知运行模式: " + options.getMode());

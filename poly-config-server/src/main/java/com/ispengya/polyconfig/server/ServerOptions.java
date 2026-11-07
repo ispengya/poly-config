@@ -85,6 +85,16 @@ public final class ServerOptions {
      */
     private final long verifyIntervalMillis;
 
+    /**
+     * CP 选举超时基数（毫秒）；实际随机 [t, 2t)，默认 1000。
+     */
+    private final long raftElectionTimeoutMillis;
+
+    /**
+     * CP 心跳周期（毫秒），默认 100。
+     */
+    private final long raftHeartbeatMillis;
+
     private ServerOptions(Builder builder) {
         this.host = builder.host;
         this.advertiseHost = builder.advertiseHost;
@@ -100,6 +110,8 @@ public final class ServerOptions {
         this.mode = builder.mode;
         this.clusterMembers = ClusterMember.parseList(builder.clusterMembers);
         this.verifyIntervalMillis = builder.verifyIntervalMillis;
+        this.raftElectionTimeoutMillis = builder.raftElectionTimeoutMillis;
+        this.raftHeartbeatMillis = builder.raftHeartbeatMillis;
     }
 
     /**
@@ -117,7 +129,8 @@ public final class ServerOptions {
      * <p>支持 --host、--advertise-host、--http-port、--remoting-port、--data-dir、
      * --node-id、--cluster-id、--history-limit、--snapshot-threshold、
      * --max-subscriptions-per-connection、--max-body-bytes、--mode、
-     * --cluster-members、--verify-interval-ms。</p>
+     * --cluster-members、--verify-interval-ms、--raft-election-timeout-ms、
+     * --raft-heartbeat-ms。</p>
      *
      * @param args 命令行参数
      * @return 启动配置
@@ -180,6 +193,12 @@ public final class ServerOptions {
                     break;
                 case "verify-interval-ms":
                     builder.verifyIntervalMillis(parseLongArg(key, value));
+                    break;
+                case "raft-election-timeout-ms":
+                    builder.raftElectionTimeoutMillis(parseLongArg(key, value));
+                    break;
+                case "raft-heartbeat-ms":
+                    builder.raftHeartbeatMillis(parseLongArg(key, value));
                     break;
                 default:
                     throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
@@ -298,6 +317,14 @@ public final class ServerOptions {
         return verifyIntervalMillis;
     }
 
+    public long getRaftElectionTimeoutMillis() {
+        return raftElectionTimeoutMillis;
+    }
+
+    public long getRaftHeartbeatMillis() {
+        return raftHeartbeatMillis;
+    }
+
     /**
      * 启动配置构造器。
      */
@@ -376,6 +403,17 @@ public final class ServerOptions {
          */
         private long verifyIntervalMillis = 5_000L;
 
+        /**
+         * CP 选举超时基数（毫秒），实际随机 [t, 2t)；默认 1000
+         * （etcd 量级——Java GC 停顿下 150~300ms 的论文值过于激进）。
+         */
+        private long raftElectionTimeoutMillis = 1_000L;
+
+        /**
+         * CP 心跳周期（毫秒），默认 100。
+         */
+        private long raftHeartbeatMillis = 100L;
+
         public Builder host(String host) {
             this.host = host;
             return this;
@@ -446,6 +484,16 @@ public final class ServerOptions {
             return this;
         }
 
+        public Builder raftElectionTimeoutMillis(long raftElectionTimeoutMillis) {
+            this.raftElectionTimeoutMillis = raftElectionTimeoutMillis;
+            return this;
+        }
+
+        public Builder raftHeartbeatMillis(long raftHeartbeatMillis) {
+            this.raftHeartbeatMillis = raftHeartbeatMillis;
+            return this;
+        }
+
         public ServerOptions build() {
             if (host == null || host.trim().isEmpty()) {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "host 不能为空");
@@ -496,11 +544,25 @@ public final class ServerOptions {
                 throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
                         "未知运行模式: " + mode + "（可选 standalone / cp / ap）");
             }
+            if (raftElectionTimeoutMillis < 100) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "raftElectionTimeoutMillis 不能小于 100（毫秒）");
+            }
+            if (raftHeartbeatMillis < 10) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "raftHeartbeatMillis 不能小于 10（毫秒）");
+            }
+            if (raftElectionTimeoutMillis < 2 * raftHeartbeatMillis) {
+                throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                        "选举超时须 ≥ 2 倍心跳周期: election=" + raftElectionTimeoutMillis
+                                + ", heartbeat=" + raftHeartbeatMillis);
+            }
             List<ClusterMember> members = ClusterMember.parseList(clusterMembers);
-            if ("ap".equals(normalizedMode)) {
+            if ("ap".equals(normalizedMode) || "cp".equals(normalizedMode)) {
+                String modeLabel = "ap".equals(normalizedMode) ? "AP" : "CP";
                 if (members.isEmpty()) {
                     throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                            "AP 模式必须通过 --cluster-members 提供静态成员列表，"
+                            modeLabel + " 模式必须通过 --cluster-members 提供静态成员列表，"
                                     + "格式 nodeId=host:httpPort:remotingPort，逗号分隔");
                 }
                 boolean selfIncluded = false;
@@ -512,7 +574,7 @@ public final class ServerOptions {
                 }
                 if (!selfIncluded) {
                     throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
-                            "AP 成员列表必须包含本节点 " + nodeId
+                            modeLabel + " 成员列表必须包含本节点 " + nodeId
                                     + "=host:httpPort:remotingPort");
                 }
             }

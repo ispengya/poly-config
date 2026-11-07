@@ -191,4 +191,66 @@ public class ServerOptionsTest {
                     expected.getMessage().contains("rpc"));
         }
     }
+
+    @Test
+    public void shouldRequireClusterMembersInCpMode() {
+        try {
+            ServerOptions.fromArgs(new String[]{"--mode=cp"});
+            fail("CP 模式缺少成员列表应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含参数名: " + expected.getMessage(),
+                    expected.getMessage().contains("cluster-members"));
+        }
+    }
+
+    @Test
+    public void shouldRequireSelfInCpClusterMembers() {
+        try {
+            ServerOptions.fromArgs(new String[]{
+                    "--mode=cp",
+                    "--cluster-members=n2=127.0.0.1:8849:9849"});
+            fail("CP 成员列表缺少本节点应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含本节点 ID: " + expected.getMessage(),
+                    expected.getMessage().contains("node-1"));
+        }
+    }
+
+    @Test
+    public void shouldDefaultRaftTiming() {
+        ServerOptions options = ServerOptions.builder().build();
+        assertEquals(1000L, options.getRaftElectionTimeoutMillis());
+        assertEquals(100L, options.getRaftHeartbeatMillis());
+    }
+
+    @Test
+    public void shouldParseRaftTimingFromArgs() {
+        ServerOptions options = ServerOptions.fromArgs(new String[]{
+                "--mode=cp",
+                "--cluster-members=node-1=127.0.0.1:8848:9848",
+                "--raft-election-timeout-ms=500",
+                "--raft-heartbeat-ms=100"});
+        assertEquals(500L, options.getRaftElectionTimeoutMillis());
+        assertEquals(100L, options.getRaftHeartbeatMillis());
+    }
+
+    @Test
+    public void shouldRejectRaftTimingWithoutEnoughSlack() {
+        try {
+            ServerOptions.builder()
+                    .raftElectionTimeoutMillis(150L)
+                    .raftHeartbeatMillis(100L)
+                    .build();
+            fail("选举超时小于 2 倍心跳应被拒绝");
+        } catch (PolyConfigException expected) {
+            assertTrue("错误信息应包含两参数: " + expected.getMessage(),
+                    expected.getMessage().contains("heartbeat"));
+        }
+        try {
+            ServerOptions.builder().raftElectionTimeoutMillis(50L).build();
+            fail("过小的选举超时应被拒绝");
+        } catch (PolyConfigException expected) {
+            // 预期
+        }
+    }
 }

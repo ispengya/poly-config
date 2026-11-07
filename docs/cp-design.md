@@ -1,6 +1,6 @@
 # poly-config CP（Raft）设计
 
-> 状态：机制与决策已确认，可进入工程（对应 product-form.md 的 M1）
+> 状态：CP-1/CP-2 已完成（日志底座与选举），进行中 CP-3（复制与提交）
 > 更新：2026-11-07
 > 前置阅读：product-form.md（CP 路线 = 手写 Raft）、ap-design.md（工程模式参照）
 
@@ -54,12 +54,16 @@
 沿用 Raft 标准机制（细节讨论记录见决策 D9）：
 
 ```
-Follower ──选举超时(随机, 默认 150~300ms)无心跳──▶ Candidate(term+1, 先投自己, 落盘)
+Follower ──选举超时(随机 [t,2t), 默认 1000~2000ms)无心跳──▶ Candidate(term+1, 先投自己, 落盘)
    ▲                                                │
    │                    多数派赞成 ─────────────────▶ Leader(立刻心跳压制)
    │                                                │
    └──── 收到更高 term / 新 leader 心跳 ────────────┘（回退 Follower）
 ```
+
+> 超时默认值取 etcd 量级（1000ms 基数、心跳 100ms，可配
+> `--raft-election-timeout-ms` / `--raft-heartbeat-ms`）：论文的 150~300ms
+> 对 Java GC 停顿过于激进；测试统一调小到 300/50 换取秒级可观测的换代。
 
 - **规则一（term 比对）**：任何消息先比 term，高者赢、低者忽略、本地 term 永不回退；
   收到更高 term 立即更新并回退。选举与复制（AppendEntries）共用同一入口逻辑。
@@ -286,8 +290,8 @@ ConfigProtocol
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| CP-1 | `RaftLog`：帧带 index/term、尾部截断 `truncateAfter`、前缀压缩接入、索引重建；`raft-meta` 持久化（fsync 语义）；恢复回放 | 单机写→崩溃重启逐号恢复；冲突尾巴截断后重启不复活；meta 丢失回退不越权 |
-| CP-2 | `RaftNode` 单线程信箱 + 三角色；RequestVote 两道闸；随机超时/心跳压制；`--mode=cp` 装配放行（先单节点） | 单节点 cp 启动写通；3 节点选出唯一 leader；杀 leader 毫秒级重选；双投/双主单测打不穿 |
+| CP-1（✅ 2026-11-07） | `RaftLog`：帧带 index/term、尾部截断 `truncateAfter`、前缀压缩接入、索引重建；`raft-meta` 持久化（fsync 语义）；恢复回放 | 单机写→崩溃重启逐号恢复；冲突尾巴截断后重启不复活；meta 丢失回退不越权 |
+| CP-2（✅ 2026-11-07） | `RaftNode` 单线程信箱 + 三角色；RequestVote 两道闸；随机超时/心跳压制；`--mode=cp` 装配放行（先单节点） | 单节点 cp 启动写通；3 节点选出唯一 leader；杀 leader 毫秒级重选；双投/双主单测打不穿 |
 | CP-3 | AppendEntries 三闸 + nextIndex 回退；commit 本 term 限定 + no-op；commit→apply 循环（推送钩子）；D5 水位；RAFT_FORWARD 写转发 + expectedVersion；组刷盘升级 | 写任意节点→全集群提交可读、三节点客户端收推送；409 照常；2/3 宕机写不可用但一条不丢、恢复自愈；图 8 用例固化成测试 |
 | CP-4 | read-index（LINEARIZABLE）；快照带 lastIncluded；InstallSnapshot 追平落后 follower | 线性一致读测试（选举窗口不回退）；快照压缩后杀 follower→重启一发追平；滚动重启收敛 |
 | CP-5 | SDK `getConfig` 加 ReadConsistency 重载（D8）；错误语义（选举中/无主提示）；RAFT_STATUS + 控制台 CP 视图（leader/term/commitIndex/peer matchIndex）；三节点测试矩阵；文档定稿 | 完整演示：杀 leader 换代、写读按语义正确；矩阵全绿；本文档补实施记录 |
@@ -296,6 +300,61 @@ ConfigProtocol
 主干且是 D5 语义缝的落点；CP-4 在正确性之上加能力；CP-5 照 AP-5 套路收尾。
 难点集中在 CP-2/CP-3（选举状态机与 commit 规则是纯新增逻辑），CP-1/4/5 多为
 组装与复用。
+
+### CP-1 实施记录（2026-11-07，已完成）
+
+- **RaftLog**（`core/raft`，底座 `SegmentLog`）：记录前缀 16B（index 8B + term 8B），
+  `append` 恒从 lastIndex+1；`termAt` 内存平行表 O(1) 不落盘；`truncateAfter` 冲突
+  截断（物理+内存同步裁剪，重启不复活）；`compactBefore` 前缀压缩（删完整段 +
+  按 `getMinOffset` 修剪内存表，残留物理条目由快照位点裁决）；恢复扫描校验 index
+  **逐号连续，不连续拒绝启动**（SegmentLog 只保留连续有效前缀，不连续只可能是
+  逻辑错误或介质损坏）。`SegmentLog` 增 `getMinOffset()`（压缩后非零起点恢复用）。
+- **RaftMetaStore**：currentTerm/votedFor，"临时文件 → fsync → 原子替换"，
+  **返回即落盘**（先落盘再投票的载体）；term 回退拒绝；文件损坏/格式不符/负 term
+  一律拒绝启动（带着丢失的 votedFor 起动可能同届重复投票——宁起不来不投错票）。
+- 测试：`RaftLogTest` 8（逐号恢复、截断持久化、越界拒绝、压缩+非零起点恢复、
+  index 跳号拒启、过短记录拒启、目录锁）、`RaftMetaStoreTest` 5（重载、不回退、
+  同届改投分层放行、三种损坏拒启）。
+
+### CP-2 实施记录（2026-11-07，已完成）
+
+- **RaftNode 单线程信箱**（§1 铁律落地）：1 线程 `ScheduledExecutorService` 同时
+  承担信箱与定时器——入站消息（网络 RPC、propose）先投递成任务，选举/心跳定时器
+  同线程调度，状态变更天然互斥、无锁。跨线程只保留一个 `volatile closed`
+  （停机开关，唯一由状态线程之外写入的标志）。
+- **选举**（§3 落地）：随机超时 `[t,2t)`（默认 t=1000ms，可配，测试 300/50）；
+  `startElection` = term+1 → 自投 → **persist fsync 先于拉票** → 并行 RequestVote；
+  投票两道闸（一 term 一票、候选人日志够新）+ **落盘先于回票**；规则一（应答/消息
+  带更高 term 立即退位、本地 term 永不回退）、规则二（计票校验
+  `role==CANDIDATE && electionTerm==currentTerm`，退位/换届后的迟到票作废）；
+  当选追加 **no-op** 并立刻心跳压制。
+- **心跳**：实体 = 空条目 AppendEntries（4002，与复制同一消息格式，逐 peer 的
+  prev 凭据随行）；发送 `RaftNode.sendHeartbeats`（状态线程定周期），接收端闸1 通过
+  即 `becomeFollower → resetElectionTimer`——**心跳压制就落地在这一行**。
+- **提交（单成员路径）**：`tryCommit` = 多数派 matchIndex + **term == currentTerm
+  限定**（Figure 8）；`applyCommitted` 逐条 apply（空载荷 no-op 跳过），完成挂起的
+  propose future。
+- **RaftProtocol**：propose 的校验+赋版本在状态线程内按序执行（D5；单成员下"已
+  apply 视图"即正确，多成员叠加水位留 CP-3）；**version = raft index**（no-op 占
+  1 号，首写 version=2，与 AP"version=写入方全局序号"同语义）；恢复：单成员
+  `commitIndex = lastIndex` 构造期即 apply——**重启读路径无空窗**，多成员为 0 等
+  leader；读/列表/历史直走状态机，workspace 标记条目与 AP 同套派生。
+- **装配**：`ServerOptions` 增 `--raft-election-timeout-ms`（默认 1000，须 ≥100 且
+  ≥2 倍心跳）、`--raft-heartbeat-ms`（默认 100）；CP 与 AP 同规格强制成员表含本节点；
+  `PolyConfigServer` 放行 `mode=cp` 并注册 RAFT_VOTE(4001)/RAFT_APPEND(4002)
+  处理器（编解码 → 投信箱 → future.get(2s) → 回包，fsync 时序由该等待保证）。
+- **范围守卫**：多节点 propose 明确报"CP 多节点写复制由 CP-3 提供"；收到带条目的
+  AppendEntries 打 warn 不应用——代码内 TODO 标注 CP-3 接入点。
+- 测试：`RaftNodeTest` 11（投票矩阵、规则一/规则二迟到票作废、单节点选主+写、
+  三节点唯一 leader + 同 term 双主采样 + 杀主换代、范围守卫、恢复无空窗），
+  `CpClusterIntegrationTest` 2（单节点写通 + 409 + **重启后不等选主立即读到已应答
+  写**；三节点选主→杀 leader→存活节点换代且 term 更高），`ServerOptionsTest` +5；
+  全量 **123 通过**。Java 8 API 合规经 `--release 8` 严格编译验证（修正
+  `List.copyOf`/无参 `orElseThrow` 两处 Java 10 API——JDK17 下 `-source 8` 不带
+  `--release` 会假绿，须以 `--release 8` 为准）。
+- **CP-3 待接**（代码 TODO 已标注）：闸3 条目追加与截断、nextIndex 回退（含
+  拒绝回带线索）、leaderCommit 传播、success→matchIndex→tryCommit、
+  RAFT_FORWARD 写转发、组刷盘升级、D5 多成员在途叠加水位。
 
 ### 测试策略
 
@@ -325,7 +384,7 @@ ConfigProtocol
 | 2026-11-07 | **D6** 单节点 `--mode=cp` 合法（自投票、多数派=1 立即提交），服务本地开发与测试 |
 | 2026-11-07 | **D7** 写应答 = commit + apply 之后；转发节点收到 leader 应答（=已提交）先幂等 apply 再答客户端（写后即读） |
 | 2026-11-07 | **D8** SDK 增加 `getConfig(..., ReadConsistency)` 重载，默认 LOCAL；HTTP 可选 `?consistency=` |
-| 2026-11-07 | **D9** 选举沿用 Raft 标准：随机超时 150~300ms、心跳 100ms（可配 `--raft-election-timeout-ms` / `--raft-heartbeat-ms`）、no-op 当选、规则一/规则二双保险 |
+| 2026-11-07 | **D9** 选举沿用 Raft 标准：随机超时 [t, 2t)、默认 t=1000ms、心跳 100ms（可配 `--raft-election-timeout-ms` / `--raft-heartbeat-ms`，须 ≥100ms 且 ≥2 倍心跳）、no-op 当选、规则一/规则二双保险；默认值取 etcd 量级而非论文 150~300ms（Java GC 停顿），测试调小到 300/50 |
 | 2026-11-07 | 提交规则带本 term 限定（Figure 8）；旧 term 条目经 no-op 连带提交 |
 | 2026-11-07 | 复制失败不重试，nextIndex 未动靠下轮心跳幂等补上；回退带 follower 线索优化，退过快照边界转 InstallSnapshot |
 | 2026-11-07 | LocalEngine 的 propose 编排不复用；零件（状态机/快照/组刷盘）复用，编排在 RaftNode 新写 |

@@ -127,21 +127,6 @@ public class ApClusterIntegrationTest {
         }
     }
 
-    @Test
-    public void shouldRejectCpModeAsUnimplemented() throws Exception {
-        Path dataDir = folder.newFolder("cp-data").toPath();
-        try {
-            new PolyConfigServer(ServerOptions.builder()
-                    .host("127.0.0.1")
-                    .dataDir(dataDir)
-                    .mode("cp")
-                    .build());
-            fail("CP 模式应明确报未实现");
-        } catch (PolyConfigException expected) {
-            assertTrue(expected.getMessage().contains("CP"));
-        }
-    }
-
     private static PolyConfigServer startApServer(Path dataDir) throws IOException {
         PolyConfigServer server = new PolyConfigServer(ServerOptions.builder()
                 .host("127.0.0.1")

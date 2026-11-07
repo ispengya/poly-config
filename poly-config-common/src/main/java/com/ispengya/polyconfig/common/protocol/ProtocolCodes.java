@@ -58,6 +58,36 @@ public final class ProtocolCodes {
     public static final int DISTRO_STATUS = 3005;
 
     /**
+     * CP 拉票：候选人向对等节点争取选票（4xxx 段为 CP 内部协议）。
+     */
+    public static final int RAFT_VOTE = 4001;
+
+    /**
+     * CP 复制/心跳：leader 向 follower 推送日志条目（空条目即心跳）。
+     */
+    public static final int RAFT_APPEND = 4002;
+
+    /**
+     * CP 快照下发：落后太多的 follower 整份接收快照（CP-4）。
+     */
+    public static final int RAFT_SNAPSHOT = 4003;
+
+    /**
+     * CP 写转发：任意节点把写请求转发给 leader（CP-3）。
+     */
+    public static final int RAFT_FORWARD = 4004;
+
+    /**
+     * CP 线性读：读请求转发 leader，read-index 在 leader 侧完成（CP-4）。
+     */
+    public static final int RAFT_READ = 4005;
+
+    /**
+     * CP 状态采集：成员自报 role/term/commitIndex，控制台聚合（CP-5）。
+     */
+    public static final int RAFT_STATUS = 4006;
+
+    /**
      * 响应成功。
      */
     public static final int RESPONSE_OK = 200;

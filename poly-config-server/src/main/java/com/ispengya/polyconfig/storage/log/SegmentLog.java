@@ -411,6 +411,24 @@ public final class SegmentLog implements Closeable {
     }
 
     /**
+     * 返回日志起始物理 offset（首个日志段的起始位置）。
+     *
+     * <p>前缀段删除后首个段可能从非 0 开始，扫描恢复必须从该位点起始
+     * （它是记录边界）；日志为空时返回 0。</p>
+     *
+     * @return 起始物理 offset
+     */
+    public long getMinOffset() {
+        rwLock.readLock().lock();
+        try {
+            ensureOpen();
+            return segments.isEmpty() ? 0L : segments.firstKey();
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    /**
      * 返回本次启动发生恢复截断的物理 offset。
      *
      * @return 截断终点；-1 表示未发生截断

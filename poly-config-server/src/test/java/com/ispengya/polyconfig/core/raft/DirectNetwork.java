@@ -2,6 +2,8 @@ package com.ispengya.polyconfig.core.raft;
 
 import com.ispengya.polyconfig.common.protocol.AppendEntriesRequest;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesResponse;
+import com.ispengya.polyconfig.common.protocol.SnapshotRequest;
+import com.ispengya.polyconfig.common.protocol.SnapshotResponse;
 import com.ispengya.polyconfig.common.protocol.VoteRequest;
 import com.ispengya.polyconfig.common.protocol.VoteResponse;
 import com.ispengya.polyconfig.consistency.ClusterMember;
@@ -86,6 +88,16 @@ final class DirectNetwork {
                 }
                 deliverAppend(peer, request, callback);
             }
+
+            @Override
+            public void sendSnapshot(ClusterMember peer, SnapshotRequest request,
+                                     Consumer<SnapshotResponse> callback) {
+                if (isolated.contains(senderId) || isolated.contains(peer.getNodeId())) {
+                    callback.accept(null);
+                    return;
+                }
+                deliverSnapshot(peer, request, callback);
+            }
         };
     }
 
@@ -108,6 +120,17 @@ final class DirectNetwork {
             return;
         }
         target.submitAppendRequest(request).whenComplete((response, error) ->
+                callback.accept(error == null ? response : null));
+    }
+
+    private void deliverSnapshot(ClusterMember peer, SnapshotRequest request,
+                                 Consumer<SnapshotResponse> callback) {
+        RaftNode target = nodes.get(peer.getNodeId());
+        if (target == null) {
+            callback.accept(null);
+            return;
+        }
+        target.submitInstallSnapshotRequest(request).whenComplete((response, error) ->
                 callback.accept(error == null ? response : null));
     }
 }

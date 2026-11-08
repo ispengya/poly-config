@@ -1,6 +1,6 @@
 # poly-config CP（Raft）设计
 
-> 状态：CP-1/CP-2/CP-3 已完成（日志底座、选举、复制与提交），进行中 CP-4（读与快照）
+> 状态：CP-1~CP-4 已完成（日志底座、选举、复制与提交、读与快照），进行中 CP-5（收尾）
 > 更新：2026-11-08
 > 前置阅读：product-form.md（CP 路线 = 手写 Raft）、ap-design.md（工程模式参照）
 
@@ -270,7 +270,7 @@ ConfigProtocol
 | 零件 | CP 用法 |
 |---|---|
 | `SegmentLog` | RaftLog 底座：追加/读写锁/组刷盘/截断/前缀删除原样用；payload 前缀带 index+term |
-| `SnapshotStore` | 状态机快照原样用，加 lastIncluded 元数据（CP-4） |
+| `SnapshotStore` | 状态机快照原样用，加 lastIncluded 元数据（CP-4 起） |
 | `ConfigStateMachine` | 原样用；apply 即推送；verifyTable/墓碑等 AP 产物 CP 不需要 |
 | `LocalEngine` | **propose 编排不复用**——"追加即生效"与"commit 才生效"是两种编排，硬合会搅浑语义；零件（状态机/快照/组刷盘）复用，编排在 RaftNode 新写（见 ap-design §10 同款教训：共用零件、不共用流程） |
 | Distro 工程模式 | forward、per-peer 复制器、processor 注册、健康时间戳、状态页——结构照搬，协议码换 4xxx |
@@ -293,7 +293,7 @@ ConfigProtocol
 | CP-1（✅ 2026-11-07） | `RaftLog`：帧带 index/term、尾部截断 `truncateAfter`、前缀压缩接入、索引重建；`raft-meta` 持久化（fsync 语义）；恢复回放 | 单机写→崩溃重启逐号恢复；冲突尾巴截断后重启不复活；meta 丢失回退不越权 |
 | CP-2（✅ 2026-11-07） | `RaftNode` 单线程信箱 + 三角色；RequestVote 两道闸；随机超时/心跳压制；`--mode=cp` 装配放行（先单节点） | 单节点 cp 启动写通；3 节点选出唯一 leader；杀 leader 毫秒级重选；双投/双主单测打不穿 |
 | CP-3（✅ 2026-11-08） | AppendEntries 三闸 + nextIndex 回退；commit 本 term 限定 + no-op；commit→apply 循环（推送钩子）；D5 水位；RAFT_FORWARD 写转发 + expectedVersion；组刷盘升级 | 写任意节点→全集群提交可读、三节点客户端收推送；409 照常；2/3 宕机写不可用但一条不丢、恢复自愈；图 8 用例固化成测试 |
-| CP-4 | read-index（LINEARIZABLE）；快照带 lastIncluded；InstallSnapshot 追平落后 follower | 线性一致读测试（选举窗口不回退）；快照压缩后杀 follower→重启一发追平；滚动重启收敛 |
+| CP-4（✅ 2026-11-08） | read-index（LINEARIZABLE）；快照带 lastIncluded；InstallSnapshot 追平落后 follower | 线性一致读测试（选举窗口不回退）；快照压缩后杀 follower→重启一发追平；滚动重启收敛 |
 | CP-5 | SDK `getConfig` 加 ReadConsistency 重载（D8）；错误语义（选举中/无主提示）；RAFT_STATUS + 控制台 CP 视图（leader/term/commitIndex/peer matchIndex）；三节点测试矩阵；文档定稿 | 完整演示：杀 leader 换代、写读按语义正确；矩阵全绿；本文档补实施记录 |
 
 顺序用意：CP-1/CP-2 先把"账本和朝代"做对（纯本地、无网络语义，地基）；CP-3 是
@@ -400,6 +400,60 @@ ConfigProtocol
   `killServer`（先秒级 `getConfigService().close()` 关协议、再 stop 清理网络；
   协议 close 幂等）。
 
+### CP-4 实施记录（2026-11-08，已完成）
+
+- **read-index（D2 落地）**：`RaftNode.readIndex()`——信箱内取 commitIndex 基线 →
+  登记在途读并立即发一轮心跳（不等周期拍）→ **仅注册之后到达的本朝应答计票**
+  （复制成败均可：应答带本朝 term 即认可本节点领导权），多数派（含自身）确认
+  且 lastApplied ≥ 基线才完成；超时兜底 max(1s, 2×选举超时)；退位/关闭/
+  fail-stop 一律作废（UNAVAILABLE，不回退）。非 leader 角色闸拒绝。
+  `RaftProtocol.read(..., LINEARIZABLE)`：非 leader 经 **RAFT_READ(4005)**
+  转发 leader（复用 `ForwardReadRequest`/`ConfigView`），leader 侧
+  `readLocalLinearizable` = readIndex + 读状态机——happens-before 经 future
+  完成建立，返回值 ≥ 基线、只向前。选举窗口/多数派宕机下读失败而非回退。
+- **快照带 lastIncluded（§7）**：`SnapshotData` 增 lastIncludedIndex/Term
+  （AP 快照二者为 0，CP 恢复时忽略非 CP 快照）；捕获统一走
+  `ConfigStateMachine.exportSnapshot(revision, lastIncludedIndex, lastIncludedTerm)`
+  （AP `LocalEngine.captureLocked` 改为委托，一套零件）。apply 计数达
+  `--snapshot-threshold` 时状态线程捕获（位点 = 当前 apply 的 index/term）→
+  异步原子写 → 成功后 `RaftNode.advanceSnapshot` 压缩日志前缀。
+  `RaftLog.compactBefore` 内存裁剪改为**按覆盖位点**（firstIndex = covered+1，
+  运行期与段对齐无关，InstallSnapshot 边界数学变精确）；物理段删除照旧，
+  重启残留（未满段尾部）由快照位点裁决——测试断言相应改为"重启 firstIndex
+  不得越过覆盖位点"。恢复：CP 快照 → 日志落后则 `resetToSnapshot` 对齐、
+  否则保留增量并压前缀 → 状态机 restore → lastApplied = 快照位点、
+  commitIndex = max(快照位点, min(recoveryCommit, lastIndex))。
+- **InstallSnapshot（4003）**：`sendAppendTo` 先过 `canServeFrom`（条目区可读
+  + 接缝 term 已知：0 / 日志内 / 快照边界），不满足整份下发快照（位点以快照
+  自身元数据为准）。闸2 增**快照边界分支**（prev == lastIncluded 用快照 term
+  核对，本地残留物理条目不可信）；闸3 增"低于保留起点的条目视为已覆盖"跳过
+  与"冲突点恰在保留起点 → `discardAll` 整表丢弃后按 expect 重对齐"。
+  follower 安装时序：**先持久化快照文件 + 恢复状态机（`RaftSnapshotAccess`
+  listener），成功才 `resetToSnapshot` 丢日志**——任一时刻崩溃可由"文件 + 日志"
+  确定性恢复；commit/lastApplied 置为快照位点（更高的未 apply 提交声明随日志
+  丢弃，leaderCommit 会重新推进）；已有覆盖 ≥ 快照位点则不重复安装、回带
+  match 校准。`RaftLog` 新增 `resetToSnapshot`/`discardAll`（`truncateAfter`
+  仍不支持整表清空——清空归快照路径，原单测语义保留）。空日志投票尾取
+  (snapshotTerm, snapshotIndex)：伪日志条目参与"日志够新"比较。
+- **装配**：`PolyConfigServer` 注册 RAFT_SNAPSHOT（`RaftSnapshotProcessor`，
+  含落盘等待放宽 5s）与 RAFT_READ（`RaftReadProcessor`）处理器；新增
+  `getProtocol()` 测试入口；快照异步写线程随协议关闭。
+- **测试**（全量 **137 通过**；`--release 8` 严格编译验证）：
+  - `RaftLogTest` 10：+快照重置边界续写与重启重建、`discardAll` 保坐标；
+    压缩用例改为"重启 firstIndex 不得越过覆盖位点"（按位点裁剪后运行期
+    位点可先于物理删除）。
+  - `RaftNodeTest` 16：+read-index leader 完成/follower 拒绝（UNAVAILABLE）、
+    孤立 leader 确认超时失败（多数派凑不齐）、InstallSnapshot 追平
+    （DirectNetwork + StubSnapshotAccess：leader 压缩后空日志 n3 加入 →
+    nextIndex 回退触界 → 安装快照 → 续传 apply，覆盖前业务写不进 apply 流）。
+  - `CpClusterIntegrationTest` 9：+**线性读**（leader 本机 / follower 转发读到
+    v1 → 杀两 follower 多数派宕机读失败 UNAVAILABLE → 恢复后仍读 v1 →
+    杀 leader 选举窗口内只允许 UNAVAILABLE 且最终读到 v1 不回退 → 新 leader
+    写 v2 线性读到 v2）；**InstallSnapshot 追平**（threshold=5，杀 follower
+    跨两批压缩 → 重启一发追平第二批 + 快照承载的完整状态可见 + version 链
+    延续）；**滚动重启收敛**（逐个杀+起，每步恢复唯一 leader、数据不丢、
+    续写 version 链正确）。
+
 ### 测试策略
 
 - 单测打状态机与闸门：投票决策矩阵、闸1/闸2 拒绝与回退、commit 本 term 限定、
@@ -434,3 +488,6 @@ ConfigProtocol
 | 2026-11-07 | LocalEngine 的 propose 编排不复用；零件（状态机/快照/组刷盘）复用，编排在 RaftNode 新写 |
 | 2026-11-07 | 静态成员复用 `--cluster-members`；v1 成员变更走停写维护窗口，成员变更协议归后续里程碑 |
 | 2026-11-07 | CP/AP 取舍明示：AP 赢分片写并行，CP 赢不丢/换主/确定恢复；写吞吐需求选 AP，强一致/高可用写选 CP |
+| 2026-11-08 | read-index 确认只计**注册之后**到达的本朝应答（复制成败均可，带本朝 term 即认可领导权）；超时兜底、退位即作废，确认失败读 UNAVAILABLE 不回退 |
+| 2026-11-08 | InstallSnapshot 安装顺序 = 先持久化快照文件 + 恢复状态机、成功才丢本地日志；已有覆盖回带 match 不重复安装；commit/lastApplied 对齐快照位点 |
+| 2026-11-08 | 快照压缩内存裁剪按覆盖位点（firstIndex = covered+1，与段对齐无关）；物理段删除照旧，重启残留由快照位点裁决 |

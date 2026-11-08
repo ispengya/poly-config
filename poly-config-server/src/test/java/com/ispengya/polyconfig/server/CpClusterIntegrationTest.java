@@ -3,6 +3,12 @@ package com.ispengya.polyconfig.server;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
+import com.ispengya.polyconfig.common.error.ErrorCode;
+import com.ispengya.polyconfig.common.error.PolyConfigException;
+import com.ispengya.polyconfig.common.model.ConfigEntry;
+import com.ispengya.polyconfig.common.model.ConfigKey;
+import com.ispengya.polyconfig.consistency.ReadConsistency;
+import com.ispengya.polyconfig.core.raft.RaftProtocol;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -17,13 +23,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * CP-2 端到端测试：单节点 cp 写通与重启恢复、三节点选主与换代。
+ * CP 端到端测试（CP-2/CP-3/CP-4）：单节点写通与重启恢复、三节点选主与
+ * 换代、写转发与故障恢复、线性读、InstallSnapshot 追平与滚动重启收敛。
  *
  * <p>端口段 18866-18868 / 19866-19868，与 AP 测试隔离；选举超时调小
  * （300ms 基数、50ms 心跳）让换代在秒级内可观测。</p>
@@ -376,11 +385,267 @@ public class CpClusterIntegrationTest {
         }
     }
 
+    // ==================== CP-4 线性读 ====================
+
+    @Test
+    public void shouldServeLinearizableReadAndFailInsteadOfStaleDuringElection()
+            throws Exception {
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<Path> dataDirs = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                dataDirs.add(folder.newFolder("cp4r-" + (i + 1)).toPath());
+            }
+            servers.add(startCpServer(dataDirs.get(0),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(dataDirs.get(1),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(dataDirs.get(2),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            ConfigKey key = new ConfigKey("public", "DEFAULT_GROUP", "lin.yml");
+            Response publish = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("lin.yml", "lin-v1", null));
+            assertEquals(200, publish.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "lin.yml", "lin-v1", 5000L);
+            }
+
+            // 正常态：leader 本机线性读 + follower 经 RAFT_READ 转发线性读 → lin-v1
+            assertEquals("lin-v1", readLinearizable(servers.get(leader.index), key));
+            int followerIndex = (leader.index + 1) % servers.size();
+            assertEquals("follower 转发线性读应读到 lin-v1",
+                    "lin-v1", readLinearizable(servers.get(followerIndex), key));
+
+            // 杀多数派：leader 凑不齐确认轮 → 线性读失败（UNAVAILABLE），不回退读旧值
+            for (int i = 0; i < servers.size(); i++) {
+                if (i != leader.index) {
+                    killServer(servers.get(i));
+                }
+            }
+            try {
+                readLinearizable(servers.get(leader.index), key);
+                fail("多数派不可用时线性读应失败而非返回旧值");
+            } catch (PolyConfigException e) {
+                assertEquals(ErrorCode.UNAVAILABLE, e.getErrorCode());
+            }
+
+            // 恢复多数派：线性读恢复可用，值仍为 lin-v1（不回退、不丢失）
+            for (int i = 0; i < servers.size(); i++) {
+                if (i != leader.index) {
+                    servers.set(i, startCpServer(dataDirs.get(i), nodeIds.get(i),
+                            THREE_MEMBERS, 18866 + i, 19866 + i));
+                }
+            }
+            awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            assertEquals("lin-v1", readLinearizable(servers.get(leader.index), key));
+
+            // 杀 leader：选举窗口内线性读要么失败、要么读到 lin-v1（绝不更旧），
+            // 最终在新 leader 当选后成功
+            killServer(servers.get(leader.index));
+            String electionWindowValue = null;
+            long deadline = System.currentTimeMillis() + 8000L;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    electionWindowValue = readLinearizable(
+                            servers.get((leader.index + 1) % servers.size()), key);
+                    break;
+                } catch (PolyConfigException e) {
+                    assertEquals("选举窗口内只允许 UNAVAILABLE: " + e.getMessage(),
+                            ErrorCode.UNAVAILABLE, e.getErrorCode());
+                    Thread.sleep(50L);
+                }
+            }
+            assertNotNull("换代后线性读应最终成功", electionWindowValue);
+            assertEquals("选举窗口线性读不得回退", "lin-v1", electionWindowValue);
+
+            // 新 leader 写 lin-v2 → 线性读必须读到 v2（≥ 之前的读，单调不回退）
+            int survivorIndex = (leader.index + 1) % servers.size();
+            Response publish2 = post(servers.get(survivorIndex).getHttpPort(),
+                    "/v1/cs/configs", publishBody("lin.yml", "lin-v2", null));
+            assertEquals(200, publish2.status);
+            assertEquals("lin-v2", readLinearizable(servers.get(survivorIndex), key));
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
+    // ==================== CP-4 InstallSnapshot 与滚动重启 ====================
+
+    @Test
+    public void shouldCatchUpRestartedFollowerViaInstallSnapshot() throws Exception {
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<Path> dataDirs = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                dataDirs.add(folder.newFolder("cp4s-" + (i + 1)).toPath());
+            }
+            // 快照阈值 5：两批写各自触发一次快照与日志压缩
+            servers.add(startCpServer(dataDirs.get(0),
+                    "node-1", THREE_MEMBERS, 18866, 19866, 5));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(dataDirs.get(1),
+                    "node-2", THREE_MEMBERS, 18867, 19867, 5));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(dataDirs.get(2),
+                    "node-3", THREE_MEMBERS, 18868, 19868, 5));
+            nodeIds.add("node-3");
+
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            int followerIndex = (leader.index + 1) % servers.size();
+
+            // 第一批 5 写（index 2..6）：各节点快照压到 6；
+            // early.yml 落在第一批且不被覆盖，用于验证快照承载的完整状态
+            Response early = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("early.yml", "early-v1", null));
+            assertEquals(200, early.status);
+            for (int i = 1; i <= 4; i++) {
+                Response publish = post(servers.get(leader.index).getHttpPort(),
+                        "/v1/cs/configs", publishBody("snap.yml", "batch1-" + i, null));
+                assertEquals(200, publish.status);
+            }
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "snap.yml", "batch1-4", 8000L);
+                awaitContent(server, "early.yml", "early-v1", 8000L);
+            }
+
+            // 杀 follower：它停在第一批；leader 继续写并把日志压缩到它够不着的边界
+            killServer(servers.get(followerIndex));
+            for (int i = 6; i <= 10; i++) {
+                Response publish = post(servers.get(leader.index).getHttpPort(),
+                        "/v1/cs/configs", publishBody("snap.yml", "batch2-" + i, null));
+                assertEquals(200, publish.status);
+            }
+            for (int i = 0; i < servers.size(); i++) {
+                if (i != followerIndex) {
+                    awaitContent(servers.get(i), "snap.yml", "batch2-10", 8000L);
+                }
+            }
+            RaftProtocol leaderProtocol =
+                    (RaftProtocol) servers.get(leader.index).getProtocol();
+            assertTrue("leader 快照位点应越过被杀 follower 的日志尾",
+                    leaderProtocol.raftNode().snapshotIndex() >= 11);
+
+            // 重启 follower：经 leader 的 InstallSnapshot 一发追平第二批，
+            // 且快照承载的完整状态（第一批的 early.yml）同样可见
+            servers.set(followerIndex, startCpServer(dataDirs.get(followerIndex),
+                    nodeIds.get(followerIndex), THREE_MEMBERS,
+                    18866 + followerIndex, 19866 + followerIndex, 5));
+            PolyConfigServer restarted = servers.get(followerIndex);
+            awaitContent(restarted, "snap.yml", "batch2-10", 15000L);
+            awaitContent(restarted, "early.yml", "early-v1", 5000L);
+            RaftProtocol restartedProtocol = (RaftProtocol) restarted.getProtocol();
+            assertTrue("重启 follower 应经 InstallSnapshot 安装 leader 快照（追平走快照路径）",
+                    restartedProtocol.raftNode().snapshotIndex() >= 11);
+
+            // 追平后继续可写可读（version 链不因快照中断）
+            Response publish = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("snap.yml", "after-snap", 11L));
+            assertEquals("快照压缩后 version 链应延续（batch2-10 的 index=11）, body="
+                    + publish.body, 200, publish.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "snap.yml", "after-snap", 8000L);
+            }
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
+    @Test
+    public void shouldConvergeAfterRollingRestart() throws Exception {
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<Path> dataDirs = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                dataDirs.add(folder.newFolder("cp4roll-" + (i + 1)).toPath());
+            }
+            servers.add(startCpServer(dataDirs.get(0),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(dataDirs.get(1),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(dataDirs.get(2),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+
+            awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            Response publish = post(servers.get(0).getHttpPort(),
+                    "/v1/cs/configs", publishBody("roll.yml", "roll-v1", null));
+            assertEquals(200, publish.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "roll.yml", "roll-v1", 8000L);
+            }
+
+            // 滚动重启：逐个杀+起，每步都恢复唯一 leader 与已提交数据
+            for (int i = 0; i < servers.size(); i++) {
+                killServer(servers.get(i));
+                servers.set(i, startCpServer(dataDirs.get(i), nodeIds.get(i),
+                        THREE_MEMBERS, 18866 + i, 19866 + i));
+                awaitExactlyOneLeader(servers, nodeIds, 10000L);
+                awaitContent(servers.get(i), "roll.yml", "roll-v1", 10000L);
+            }
+
+            // 全部滚动完：一条不丢、集群唯一 leader、继续可写
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "roll.yml", "roll-v1", 8000L);
+            }
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            Response publish2 = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("roll.yml", "roll-v2", 2L));
+            assertEquals("滚动重启后 version 链应延续, body=" + publish2.body,
+                    200, publish2.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "roll.yml", "roll-v2", 8000L);
+            }
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
     // ==================== 辅助 ====================
+
+    private static String readLinearizable(PolyConfigServer server, ConfigKey key) {
+        RaftProtocol protocol = (RaftProtocol) server.getProtocol();
+        Optional<ConfigEntry> entry = protocol.read(key, ReadConsistency.LINEARIZABLE);
+        return entry.map(ConfigEntry::getContent).orElse(null);
+    }
 
     private static PolyConfigServer startCpServer(Path dataDir, String nodeId,
                                                    String members, int httpPort,
                                                    int remotingPort) throws IOException {
+        return startCpServer(dataDir, nodeId, members, httpPort, remotingPort, 10000);
+    }
+
+    private static PolyConfigServer startCpServer(Path dataDir, String nodeId,
+                                                   String members, int httpPort,
+                                                   int remotingPort,
+                                                   int snapshotThreshold) throws IOException {
         PolyConfigServer server = new PolyConfigServer(ServerOptions.builder()
                 .host("127.0.0.1")
                 .advertiseHost("127.0.0.1")
@@ -391,6 +656,7 @@ public class CpClusterIntegrationTest {
                 .clusterId("cp-test")
                 .mode("cp")
                 .clusterMembers(members)
+                .snapshotThreshold(snapshotThreshold)
                 .raftElectionTimeoutMillis(300L)
                 .raftHeartbeatMillis(50L)
                 .build());

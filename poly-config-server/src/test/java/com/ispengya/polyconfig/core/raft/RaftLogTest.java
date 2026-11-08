@@ -172,16 +172,74 @@ public class RaftLogTest {
         assertEquals(31, raftLog.append(1, bytes("cmd-31")));
         raftLog.close();
 
-        // 重启：firstIndex 与压缩后一致（残留物理记录的语义由快照位点裁决，
-        // 此处段全部完整覆盖，重启后无残留）
+        // 重启：物理残留（未满段中的覆盖区尾部记录）可能让 firstIndex 略小于
+        // 压缩时位点——覆盖位点之后的条目必须仍可读，更早的由快照位点裁决
         RaftLog reopened = new RaftLog(dir);
-        assertEquals(firstAfterCompact, reopened.firstIndex());
+        assertTrue("重启后 firstIndex 不得越过覆盖位点: " + reopened.firstIndex(),
+                reopened.firstIndex() <= firstAfterCompact);
         assertEquals(31, reopened.lastIndex());
         assertArrayEquals(bytes("cmd-" + firstAfterCompact),
                 reopened.read(firstAfterCompact).getPayload());
         assertArrayEquals(bytes("cmd-31"), reopened.read(31).getPayload());
-        assertEquals(firstAfterCompact, reopened.firstIndex());
         reopened.close();
+    }
+
+    @Test
+    public void shouldResetToSnapshotBoundaryAndContinueAppending() throws Exception {
+        // CP-4：InstallSnapshot 后整表清空、起点对齐 lastIncludedIndex+1
+        Path dir = folder.newFolder("reset-snapshot").toPath();
+        RaftLog raftLog = new RaftLog(dir);
+        for (int i = 1; i <= 6; i++) {
+            raftLog.append(1, bytes("cmd-" + i));
+        }
+        raftLog.resetToSnapshot(4);
+        assertEquals(5, raftLog.firstIndex());
+        assertEquals(4, raftLog.lastIndex());
+        assertTrue("重置后应为空日志", raftLog.isEmpty());
+        try {
+            raftLog.read(4);
+            fail("覆盖位点不应可读");
+        } catch (PolyConfigException expected) {
+            assertEquals(ErrorCode.INVALID_ARGUMENT, expected.getErrorCode());
+        }
+        // 下一条追加落在快照边界之后，逐号连续
+        assertEquals(5, raftLog.append(2, bytes("cmd-5-new")));
+        assertEquals(6, raftLog.append(2, bytes("cmd-6-new")));
+        assertEquals(2, raftLog.termAt(5));
+        raftLog.close();
+
+        // 重置后的追加已持久化：重启按记录内嵌 index 重建出快照边界
+        RaftLog reopened = new RaftLog(dir);
+        assertEquals(5, reopened.firstIndex());
+        assertEquals(6, reopened.lastIndex());
+        assertArrayEquals(bytes("cmd-5-new"), reopened.read(5).getPayload());
+
+        // 再次重置（如恢复期发现日志落后快照）：整表清空、边界重对齐
+        reopened.resetToSnapshot(4);
+        assertTrue(reopened.isEmpty());
+        assertEquals(5, reopened.firstIndex());
+        assertEquals(5, reopened.append(3, bytes("cmd-5-newer")));
+        reopened.close();
+    }
+
+    @Test
+    public void shouldDiscardAllKeepingFirstIndex() throws Exception {
+        // CP-4：冲突点恰在保留起点时整表丢弃，firstIndex 坐标不变、追加对齐
+        Path dir = folder.newFolder("discard-all").toPath();
+        RaftLog raftLog = new RaftLog(dir);
+        for (int i = 1; i <= 6; i++) {
+            raftLog.append(1, bytes("cmd-" + i));
+        }
+        raftLog.resetToSnapshot(4);
+        assertEquals(5, raftLog.append(2, bytes("old-5")));
+        assertEquals(6, raftLog.append(2, bytes("old-6")));
+
+        raftLog.discardAll();
+        assertTrue(raftLog.isEmpty());
+        assertEquals("firstIndex 坐标应保持", 5, raftLog.firstIndex());
+        assertEquals("清空后追加应落在 firstIndex", 5, raftLog.append(3, bytes("new-5")));
+        assertEquals(3, raftLog.termAt(5));
+        raftLog.close();
     }
 
     @Test

@@ -2,6 +2,8 @@ package com.ispengya.polyconfig.core.raft;
 
 import com.ispengya.polyconfig.common.protocol.AppendEntriesRequest;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesResponse;
+import com.ispengya.polyconfig.common.protocol.SnapshotRequest;
+import com.ispengya.polyconfig.common.protocol.SnapshotResponse;
 import com.ispengya.polyconfig.common.protocol.VoteRequest;
 import com.ispengya.polyconfig.common.protocol.VoteResponse;
 import com.ispengya.polyconfig.consistency.ClusterMember;
@@ -34,4 +36,14 @@ public interface RaftTransport {
      */
     void sendAppend(ClusterMember peer, AppendEntriesRequest request,
                     Consumer<AppendEntriesResponse> callback);
+
+    /**
+     * 异步发送快照下发请求（InstallSnapshot，CP-4）。
+     *
+     * @param peer 目标成员
+     * @param request 快照请求
+     * @param callback 应答回调；失败传 {@code null}
+     */
+    void sendSnapshot(ClusterMember peer, SnapshotRequest request,
+                      Consumer<SnapshotResponse> callback);
 }

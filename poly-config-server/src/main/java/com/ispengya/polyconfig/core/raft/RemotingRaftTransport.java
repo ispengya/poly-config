@@ -3,6 +3,8 @@ package com.ispengya.polyconfig.core.raft;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesRequest;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesResponse;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
+import com.ispengya.polyconfig.common.protocol.SnapshotRequest;
+import com.ispengya.polyconfig.common.protocol.SnapshotResponse;
 import com.ispengya.polyconfig.common.protocol.VoteRequest;
 import com.ispengya.polyconfig.common.protocol.VoteResponse;
 import com.ispengya.polyconfig.common.util.JsonUtils;
@@ -98,6 +100,32 @@ final class RemotingRaftTransport implements RaftTransport {
                 }
             } catch (Exception e) {
                 log.debug("复制/心跳发送失败: peer={}: {}", peer.getNodeId(), e.toString());
+            }
+            callback.accept(response);
+        });
+    }
+
+    @Override
+    public void sendSnapshot(ClusterMember peer, SnapshotRequest request,
+                             Consumer<SnapshotResponse> callback) {
+        sendPool.execute(() -> {
+            SnapshotResponse response = null;
+            try {
+                RemotingCommand rpc = RemotingCommand.createRequestCommand(
+                        ProtocolCodes.RAFT_SNAPSHOT, null);
+                rpc.setBody(JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8));
+                RemotingCommand result = client.invokeSync(address(peer), rpc, rpcTimeoutMillis);
+                if (result.getCode() == ProtocolCodes.RESPONSE_OK
+                        && result.getBody() != null && result.getBody().length > 0) {
+                    response = JsonUtils.parseObject(
+                            new String(result.getBody(), StandardCharsets.UTF_8),
+                            SnapshotResponse.class);
+                } else {
+                    log.debug("快照下发被拒绝/异常: peer={}, code={}", peer.getNodeId(),
+                            result.getCode());
+                }
+            } catch (Exception e) {
+                log.debug("快照下发发送失败: peer={}: {}", peer.getNodeId(), e.toString());
             }
             callback.accept(response);
         });

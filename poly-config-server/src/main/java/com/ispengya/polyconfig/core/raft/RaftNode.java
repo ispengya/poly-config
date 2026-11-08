@@ -5,9 +5,13 @@ import com.ispengya.polyconfig.common.error.PolyConfigException;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesRequest;
 import com.ispengya.polyconfig.common.protocol.AppendEntriesResponse;
 import com.ispengya.polyconfig.common.protocol.LogEntryData;
+import com.ispengya.polyconfig.common.protocol.SnapshotRequest;
+import com.ispengya.polyconfig.common.protocol.SnapshotResponse;
 import com.ispengya.polyconfig.common.protocol.VoteRequest;
 import com.ispengya.polyconfig.common.protocol.VoteResponse;
+import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.consistency.ClusterMember;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,9 +20,11 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -57,9 +63,16 @@ import java.util.function.Consumer;
  * 侧一轮 AppendEntries 的全部条目也只 fsync 一次。leader 计入多数派的
  * 自身 matchIndex 只在 fsync 完成后推进（先持久化、再计票）。</p>
  *
+ * <p>CP-4 起提供 read-index 线性读与 InstallSnapshot：读在信箱内取
+ * commitIndex 基线 → 心跳轮向多数派确认领导权（注册后的应答才计票）→
+ * 等 lastApplied 覆盖后完成，选举窗口/分区下失败而非回退；复制回退触到
+ * 快照边界（nextIndex 无法用日志组装 AppendEntries）时整份下发快照，
+ * follower 先持久化再丢日志、对齐 lastIncludedIndex+1 继续追日志。</p>
+ *
  * <p><b>规模说明（刻意例外）</b>：本类超出 800 行软上限属有意为之——选举、
- * 复制、提交、组刷盘全部读写同一批"仅状态线程可见"的字段，按职责拆类会
- * 迫使这些字段公开或加锁，破坏 §1 的单线程信箱铁律；拆分收益低于内聚损失。</p>
+ * 复制、提交、组刷盘、读确认与快照时序全部读写同一批"仅状态线程可见"的
+ * 字段，按职责拆类会迫使这些字段公开或加锁，破坏 §1 的单线程信箱铁律；
+ * 拆分收益低于内聚损失。</p>
  */
 public final class RaftNode implements Closeable {
 
@@ -80,6 +93,16 @@ public final class RaftNode implements Closeable {
     private volatile String leaderIdView = "";
 
     private volatile long commitIndexView;
+
+    /**
+     * 快照位点对外视图（状态线程写，测试/诊断读）。
+     */
+    private volatile long snapshotIndexView;
+
+    /**
+     * 已 apply 位点对外视图（状态线程写，测试/诊断读）。
+     */
+    private volatile long lastAppliedView;
 
     /**
      * 是否已关闭。
@@ -103,9 +126,19 @@ public final class RaftNode implements Closeable {
 
     private final RaftApplyListener applyListener;
 
+    /**
+     * 快照存储访问口（InstallSnapshot 下发与安装）；可为 null（无快照能力）。
+     */
+    private final RaftSnapshotAccess snapshotAccess;
+
     private final long electionTimeoutMillis;
 
     private final long heartbeatMillis;
+
+    /**
+     * read-index 领导权确认的超时兜底。
+     */
+    private final long readConfirmTimeoutMillis;
 
     private final Random random = new Random();
 
@@ -139,6 +172,17 @@ public final class RaftNode implements Closeable {
     private long lastApplied;
 
     /**
+     * 快照位点（lastIncludedIndex，0 = 无快照）：覆盖区间不可读、
+     * 闸2 对该位点单独用快照 term 核对、复制回退触界转 InstallSnapshot。
+     */
+    private long snapshotIndex;
+
+    /**
+     * 快照位点的 term（伪日志条目的"身份证"）。
+     */
+    private long snapshotTerm;
+
+    /**
      * 日志有未 fsync 的追加（组刷盘合并用）。
      */
     private boolean logDirty;
@@ -164,9 +208,37 @@ public final class RaftNode implements Closeable {
     private final Map<Long, CompletableFuture<Long>> applyWaiters = new HashMap<>();
 
     /**
+     * 在途线性读（read-index，CP-4）：注册后取得多数派领导权确认、
+     * 且 lastApplied 覆盖基线才完成；退位/超时一律作废。
+     */
+    private final List<PendingRead> pendingReads = new ArrayList<>();
+
+    /**
      * peer 最近一次成功交互时间（nodeId → epoch millis），喂状态页健康位。
      */
     private final ConcurrentHashMap<String, Long> peerLastSeen = new ConcurrentHashMap<>();
+
+    /**
+     * 创建 Raft 节点（无快照能力：CP-2/CP-3 兼容入口）。
+     *
+     * @param nodeId 本节点 ID
+     * @param members 静态成员列表（须包含本节点）
+     * @param raftLog 日志
+     * @param metaStore term/vote 元数据
+     * @param transport 节点间传输
+     * @param applyListener 已提交条目 apply 回调
+     * @param electionTimeoutMillis 选举超时基数（实际随机 [t, 2t)）
+     * @param heartbeatMillis 心跳周期（leader 发送空 AppendEntries 的间隔）
+     * @param recoveryCommitIndex 恢复时的初始 commitIndex
+     */
+    public RaftNode(String nodeId, List<ClusterMember> members, RaftLog raftLog,
+                    RaftMetaStore metaStore, RaftTransport transport,
+                    RaftApplyListener applyListener, long electionTimeoutMillis,
+                    long heartbeatMillis, long recoveryCommitIndex) {
+        this(nodeId, members, raftLog, metaStore, transport, applyListener,
+                electionTimeoutMillis, heartbeatMillis, recoveryCommitIndex,
+                0L, 0L, null);
+    }
 
     /**
      * 创建 Raft 节点。
@@ -181,11 +253,16 @@ public final class RaftNode implements Closeable {
      * @param heartbeatMillis 心跳周期（leader 发送空 AppendEntries 的间隔）
      * @param recoveryCommitIndex 恢复时的初始 commitIndex：单成员集群日志即
      *                            权威（= lastIndex），多成员为 0 等 leader 重新提交
+     * @param snapshotIndex 恢复自快照的 lastIncludedIndex（0 = 无快照）
+     * @param snapshotTerm 恢复自快照的 lastIncludedTerm
+     * @param snapshotAccess 快照存储访问口（InstallSnapshot 用），可为 null
      */
     public RaftNode(String nodeId, List<ClusterMember> members, RaftLog raftLog,
                     RaftMetaStore metaStore, RaftTransport transport,
                     RaftApplyListener applyListener, long electionTimeoutMillis,
-                    long heartbeatMillis, long recoveryCommitIndex) {
+                    long heartbeatMillis, long recoveryCommitIndex,
+                    long snapshotIndex, long snapshotTerm,
+                    RaftSnapshotAccess snapshotAccess) {
         if (nodeId == null || nodeId.isEmpty()) {
             throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "nodeId 不能为空");
         }
@@ -210,15 +287,24 @@ public final class RaftNode implements Closeable {
         this.metaStore = metaStore;
         this.transport = transport;
         this.applyListener = applyListener;
+        this.snapshotAccess = snapshotAccess;
         this.electionTimeoutMillis = electionTimeoutMillis;
         this.heartbeatMillis = heartbeatMillis;
+        this.readConfirmTimeoutMillis = Math.max(1_000L, 2 * electionTimeoutMillis);
         this.termView = metaStore.currentTerm();
-        this.commitIndex = Math.max(0, Math.min(recoveryCommitIndex, raftLog.lastIndex()));
+        this.snapshotIndex = snapshotIndex;
+        this.snapshotTerm = snapshotTerm;
+        this.snapshotIndexView = snapshotIndex;
+        // 恢复起点 = 快照位点：状态机已含快照状态，apply 只走其后的日志增量
+        this.lastApplied = snapshotIndex;
+        this.lastAppliedView = snapshotIndex;
+        this.commitIndex = Math.max(snapshotIndex,
+                Math.min(recoveryCommitIndex, raftLog.lastIndex()));
         this.commitIndexView = this.commitIndex;
 
-        // 单成员恢复：日志即权威，立即把已提交区间 apply 进状态机
+        // 单成员恢复：日志即权威，立即把 (快照位点, commitIndex] apply 进状态机
         // （对象尚未发布，构造线程执行安全；此后一切变更都走状态线程）
-        if (this.commitIndex > 0) {
+        if (this.commitIndex > this.lastApplied) {
             this.matchIndex.put(nodeId, raftLog.lastIndex());
             applyCommitted();
         }
@@ -253,6 +339,7 @@ public final class RaftNode implements Closeable {
             Thread.currentThread().interrupt();
         }
         failWaiters(new PolyConfigException(ErrorCode.UNAVAILABLE, "Raft 节点已关闭"));
+        failPendingReads(new PolyConfigException(ErrorCode.UNAVAILABLE, "Raft 节点已关闭"));
         // 节点关闭即释放日志句柄（SegmentLog.close 幂等，上层重复关闭无害）
         raftLog.close();
     }
@@ -287,6 +374,24 @@ public final class RaftNode implements Closeable {
 
     public long commitIndex() {
         return commitIndexView;
+    }
+
+    /**
+     * 快照位点（lastIncludedIndex，0 = 无快照）。
+     *
+     * @return 快照覆盖到的 index
+     */
+    public long snapshotIndex() {
+        return snapshotIndexView;
+    }
+
+    /**
+     * 已 apply 的日志位点。
+     *
+     * @return lastApplied
+     */
+    public long lastApplied() {
+        return lastAppliedView;
     }
 
     /**
@@ -419,6 +524,133 @@ public final class RaftNode implements Closeable {
         }
     }
 
+    // ==================== read-index 线性读（CP-4） ====================
+
+    /**
+     * read-index 基线（cp-design.md §6，D2）：信箱内取 commitIndex →
+     * 心跳轮向多数派确认领导权（仅注册之后到达的应答计票）→ 等
+     * lastApplied 覆盖基线后完成。不写日志、无磁盘动作。
+     *
+     * <p>非 leader / 退位 / 多数派不可达（超时）一律以 UNAVAILABLE 失败——
+     * 选举窗口内读不回退、不返回旧值，由调用方重试。</p>
+     *
+     * @return readIndex 基线 future（完成即状态机已覆盖该位点）
+     */
+    public CompletableFuture<Long> readIndex() {
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        runOnState(() -> {
+            try {
+                if (closed) {
+                    throw new PolyConfigException(ErrorCode.UNAVAILABLE, "Raft 节点已关闭");
+                }
+                if (broken) {
+                    throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                            "节点已 fail-stop，请重启恢复");
+                }
+                if (role != RaftRole.LEADER) {
+                    String leader = leaderId.isEmpty() ? "（选举中）" : ", leader=" + leaderId;
+                    throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                            "当前节点不是 leader" + leader);
+                }
+                PendingRead read = new PendingRead(commitIndex, future);
+                pendingReads.add(read);
+                read.timeout = stateExecutor.schedule(() -> {
+                    if (pendingReads.remove(read)) {
+                        read.future.completeExceptionally(new PolyConfigException(
+                                ErrorCode.UNAVAILABLE,
+                                "read-index 领导权确认超时（多数派不可达或网络分区），请重试"));
+                    }
+                }, readConfirmTimeoutMillis, TimeUnit.MILLISECONDS);
+                // 立即发起一轮心跳，不等下一拍周期心跳
+                sendHeartbeats();
+                tryCompleteRead(read);
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        });
+        return future;
+    }
+
+    /**
+     * 对端在本朝的应答到达（状态线程）：对所有在途读登记确认票。
+     *
+     * <p>应答（无论复制是否被闸2 拒绝）带本朝 term 即证明对端认可本节点
+     * 当前任期的领导权；注册之前的应答不计票（读基线之后才可确认）。</p>
+     *
+     * @param peerId 应答方
+     */
+    private void confirmRead(String peerId) {
+        if (pendingReads.isEmpty()) {
+            return;
+        }
+        for (PendingRead read : new ArrayList<>(pendingReads)) {
+            read.confirmed.add(peerId);
+            tryCompleteRead(read);
+        }
+    }
+
+    /**
+     * 判定单个在途读可否完成：多数派已确认（自身计一票）且状态机已覆盖基线。
+     *
+     * @param read 在途读
+     */
+    private void tryCompleteRead(PendingRead read) {
+        if (read.future.isDone()) {
+            pendingReads.remove(read);
+            return;
+        }
+        if (read.confirmed.size() + 1 < majority()) {
+            return;
+        }
+        if (lastApplied < read.readIndex) {
+            return;
+        }
+        if (pendingReads.remove(read) && read.timeout != null) {
+            read.timeout.cancel(false);
+        }
+        read.future.complete(read.readIndex);
+    }
+
+    /**
+     * 作废全部在途读（退位/关闭/fail-stop）：客户端按错误语义重试新 leader。
+     *
+     * @param cause 失败原因
+     */
+    private void failPendingReads(PolyConfigException cause) {
+        for (PendingRead read : pendingReads) {
+            if (read.timeout != null) {
+                read.timeout.cancel(false);
+            }
+            read.future.completeExceptionally(cause);
+        }
+        pendingReads.clear();
+    }
+
+    /**
+     * 在途线性读：基线 + 领导权确认状态。
+     */
+    private static final class PendingRead {
+
+        /**
+         * 注册时的 commitIndex 基线。
+         */
+        private final long readIndex;
+
+        private final CompletableFuture<Long> future;
+
+        /**
+         * 注册之后确认本朝领导权的对端（自身不入表，计票时 +1）。
+         */
+        private final Set<String> confirmed = new HashSet<>();
+
+        private ScheduledFuture<?> timeout;
+
+        private PendingRead(long readIndex, CompletableFuture<Long> future) {
+            this.readIndex = readIndex;
+            this.future = future;
+        }
+    }
+
     // ==================== 投票处理（状态线程） ====================
 
     private VoteResponse handleVoteRequest(VoteRequest request) {
@@ -438,10 +670,11 @@ public final class RaftNode implements Closeable {
         }
 
         // 投票两道闸：本 term 未投他人 + 候选人日志够新
+        // （日志尾 = 空日志时取快照位点：伪日志条目也算"日志"）
         String votedFor = metaStore.votedFor();
         boolean canVote = votedFor == null || votedFor.equals(request.getCandidateId());
-        boolean logUpToDate = request.getLastLogTerm() > raftLog.lastTerm()
-                || (request.getLastLogTerm() == raftLog.lastTerm()
+        boolean logUpToDate = request.getLastLogTerm() > localLastLogTerm()
+                || (request.getLastLogTerm() == localLastLogTerm()
                 && request.getLastLogIndex() >= raftLog.lastIndex());
 
         VoteResponse response = new VoteResponse(metaStore.currentTerm(), false);
@@ -520,9 +753,17 @@ public final class RaftNode implements Closeable {
 
         // 闸2：prevLog 接缝核对（prevLogIndex=0 表示从头开始，无接缝可校验）
         long prev = request.getPrevLogIndex();
-        boolean aligned = prev == 0
-                || (prev >= raftLog.firstIndex() && prev <= raftLog.lastIndex()
-                && raftLog.termAt(prev) == request.getPrevLogTerm());
+        boolean aligned;
+        if (prev == 0) {
+            aligned = true;
+        } else if (prev == snapshotIndex) {
+            // 快照边界优先：覆盖位点的 term 以快照元数据为准
+            // （本地可能残留物理条目，其 term 不可信）
+            aligned = request.getPrevLogTerm() == snapshotTerm;
+        } else {
+            aligned = prev >= raftLog.firstIndex() && prev <= raftLog.lastIndex()
+                    && raftLog.termAt(prev) == request.getPrevLogTerm();
+        }
         if (!aligned) {
             // 拒绝并回带日志尾线索（leader 据此跳跃回退 nextIndex）
             response.setTerm(metaStore.currentTerm());
@@ -558,8 +799,12 @@ public final class RaftNode implements Closeable {
 
         // 闸3：冲突截断 + 追加（同号同 term 的重复条目幂等跳过）
         if (entryCount > 0) {
-            long expect = prev + 1;
-            int matched = 0;
+            long entryStart = prev + 1;
+            // 低于保留起点的条目已被快照覆盖（prev=0 而本节点已压缩时出现）
+            int skip = (int) Math.max(0,
+                    Math.min(entryCount, raftLog.firstIndex() - entryStart));
+            long expect = entryStart + skip;
+            int matched = skip;
             while (matched < entryCount
                     && expect <= raftLog.lastIndex()
                     && raftLog.termAt(expect) == entries.get(matched).getTerm()) {
@@ -568,8 +813,13 @@ public final class RaftNode implements Closeable {
             }
             if (matched < entryCount) {
                 if (expect <= raftLog.lastIndex()) {
-                    // 冲突尾巴整段截断（保留 [firstIndex, expect-1]）
-                    raftLog.truncateAfter(expect - 1);
+                    if (expect > raftLog.firstIndex()) {
+                        // 冲突尾巴整段截断（保留 [firstIndex, expect-1]）
+                        raftLog.truncateAfter(expect - 1);
+                    } else {
+                        // 冲突点恰在保留起点：整表丢弃后按 expect 重新对齐
+                        raftLog.discardAll();
+                    }
                 }
                 for (int i = matched; i < entryCount; i++) {
                     raftLog.append(entries.get(i).getTerm(), payloads[i]);
@@ -629,6 +879,8 @@ public final class RaftNode implements Closeable {
         if (peer == null) {
             return;
         }
+        // 本朝应答（成功或被拒）= 对端认可本任期领导权 → 计入 read-index 确认
+        confirmRead(peerId);
         if (response.isSuccess()) {
             long match = response.getMatchIndex();
             long known = matchIndex.getOrDefault(peerId, 0L);
@@ -636,6 +888,8 @@ public final class RaftNode implements Closeable {
                 matchIndex.put(peerId, match);
             }
             long next = Math.max(nextIndex.getOrDefault(peerId, 1L), match + 1);
+            // 防御：match 不得把 nextIndex 推过本地日志尾之后
+            next = Math.min(next, raftLog.lastIndex() + 1);
             nextIndex.put(peerId, next);
             tryCommit();
             // 该 follower 仍有缺口 → 立即续传（不等下一轮心跳）
@@ -655,6 +909,184 @@ public final class RaftNode implements Closeable {
             log.debug("复制被拒回退: peer={}, nextIndex {} -> {}", peerId, next, retreated);
             sendAppendTo(peer);
         }
+    }
+
+    // ==================== InstallSnapshot（CP-4，状态线程） ====================
+
+    /**
+     * 处理快照下发请求（网络线程投递，状态线程执行并完成 future）。
+     *
+     * @param request 快照请求
+     * @return 应答 future（在状态线程上完成）
+     */
+    public CompletableFuture<SnapshotResponse> submitInstallSnapshotRequest(
+            SnapshotRequest request) {
+        CompletableFuture<SnapshotResponse> future = new CompletableFuture<>();
+        runOnState(() -> {
+            try {
+                future.complete(handleInstallSnapshot(request));
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        });
+        return future;
+    }
+
+    /**
+     * 投递快照应答到信箱（任意线程安全；传输回调与测试共用入口）。
+     *
+     * @param peerId 应答方
+     * @param response 应答；失败为 {@code null}
+     */
+    void deliverSnapshotResponse(String peerId, SnapshotResponse response) {
+        runOnState(() -> onSnapshotResponse(peerId, response));
+    }
+
+    private SnapshotResponse handleInstallSnapshot(SnapshotRequest request) {
+        if (request == null || request.getLeaderId() == null) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT, "快照请求非法");
+        }
+        long currentTerm = metaStore.currentTerm();
+        SnapshotResponse response = new SnapshotResponse();
+        response.setLastLogIndex(raftLog.lastIndex());
+        response.setLastLogTerm(localLastLogTerm());
+
+        // 闸1：term 比对——过期 leader 直接拒绝并回带本朝 term（规则一）
+        if (request.getTerm() < currentTerm) {
+            response.setTerm(currentTerm);
+            response.setSuccess(false);
+            return response;
+        }
+        if (request.getTerm() > currentTerm) {
+            metaStore.persist(request.getTerm(), null);
+        }
+        becomeFollower(request.getLeaderId());
+        recordPeerSeen(request.getLeaderId());
+
+        if (broken) {
+            response.setTerm(metaStore.currentTerm());
+            response.setSuccess(false);
+            return response;
+        }
+        SnapshotData data = JsonUtils.parseObject(request.getSnapshot(), SnapshotData.class);
+        if (data == null || data.getLastIncludedIndex() <= 0
+                || data.getLastIncludedIndex() != request.getLastIncludedIndex()
+                || data.getLastIncludedTerm() != request.getLastIncludedTerm()) {
+            log.warn("快照内容非法或与位点不一致: leader={}, lastIncludedIndex={}",
+                    request.getLeaderId(), request.getLastIncludedIndex());
+            response.setTerm(metaStore.currentTerm());
+            response.setSuccess(false);
+            return response;
+        }
+        // 已有同等或更新覆盖：不重复安装，回带当前覆盖位点供 leader 校准
+        long covered = Math.max(snapshotIndex, lastApplied);
+        if (data.getLastIncludedIndex() <= covered) {
+            response.setTerm(metaStore.currentTerm());
+            response.setSuccess(true);
+            response.setMatchIndex(covered);
+            response.setLastLogIndex(raftLog.lastIndex());
+            response.setLastLogTerm(localLastLogTerm());
+            return response;
+        }
+        if (snapshotAccess == null) {
+            response.setTerm(metaStore.currentTerm());
+            response.setSuccess(false);
+            return response;
+        }
+        // 安装顺序：先持久化快照文件 + 恢复状态机（任一时刻崩溃可确定性
+        // 恢复），成功后再丢弃本地日志、对齐快照边界
+        try {
+            snapshotAccess.installSnapshot(data);
+        } catch (RuntimeException e) {
+            log.error("安装快照失败（持久化/恢复异常），拒绝本份快照: leader={}, lastIncludedIndex={}",
+                    request.getLeaderId(), data.getLastIncludedIndex(), e);
+            response.setTerm(metaStore.currentTerm());
+            response.setSuccess(false);
+            return response;
+        }
+        raftLog.resetToSnapshot(data.getLastIncludedIndex());
+        snapshotIndex = data.getLastIncludedIndex();
+        snapshotTerm = data.getLastIncludedTerm();
+        snapshotIndexView = snapshotIndex;
+        lastApplied = snapshotIndex;
+        lastAppliedView = lastApplied;
+        // 丢弃更高的未 apply 提交声明（其条目已随日志丢弃，leaderCommit 会重新推进）
+        commitIndex = snapshotIndex;
+        updateViews();
+        log.info("安装快照: leader={}, lastIncludedIndex={}, lastIncludedTerm={}",
+                request.getLeaderId(), snapshotIndex, snapshotTerm);
+        response.setTerm(metaStore.currentTerm());
+        response.setSuccess(true);
+        response.setMatchIndex(snapshotIndex);
+        response.setLastLogIndex(raftLog.lastIndex());
+        response.setLastLogTerm(localLastLogTerm());
+        return response;
+    }
+
+    /**
+     * 快照应答（状态线程）：success → 校准 matchIndex/nextIndex 后继续补日志；
+     * failure（持久化拒绝等）不动位点，下一轮心跳重发快照。
+     *
+     * @param peerId 应答方
+     * @param response 应答；传输失败为 {@code null}
+     */
+    void onSnapshotResponse(String peerId, SnapshotResponse response) {
+        if (closed || response == null) {
+            return;
+        }
+        recordPeerSeen(peerId);
+        if (response.getTerm() > metaStore.currentTerm()) {
+            stepDown(response.getTerm());
+            return;
+        }
+        if (role != RaftRole.LEADER || response.getTerm() < metaStore.currentTerm()) {
+            return;
+        }
+        // 对端接受本朝快照/覆盖确认 = 认可本任期领导权 → read-index 计票
+        confirmRead(peerId);
+        if (!response.isSuccess()) {
+            return;
+        }
+        ClusterMember peer = memberById(peerId);
+        if (peer == null) {
+            return;
+        }
+        long match = response.getMatchIndex();
+        long known = matchIndex.getOrDefault(peerId, 0L);
+        if (match > known) {
+            matchIndex.put(peerId, match);
+        }
+        long next = Math.max(nextIndex.getOrDefault(peerId, 1L), match + 1);
+        next = Math.min(next, raftLog.lastIndex() + 1);
+        nextIndex.put(peerId, next);
+        tryCommit();
+        // 快照落地后仍有日志缺口 → 立即续传（不等下一轮心跳）
+        if (nextIndex.getOrDefault(peerId, raftLog.lastIndex() + 1)
+                <= raftLog.lastIndex()) {
+            sendAppendTo(peer);
+        }
+    }
+
+    /**
+     * 快照位点推进（状态线程任务）：压缩日志前缀并登记新位点，
+     * 复制回退触到该边界即转 InstallSnapshot。由协议层在快照文件
+     * 持久化成功后调用。
+     *
+     * @param index 快照覆盖到的 index
+     * @param term 该 index 的 term
+     */
+    public void advanceSnapshot(long index, long term) {
+        runOnState(() -> {
+            if (closed || index <= snapshotIndex) {
+                return;
+            }
+            int removed = raftLog.compactBefore(index);
+            snapshotIndex = index;
+            snapshotTerm = term;
+            snapshotIndexView = index;
+            log.info("快照位点推进: lastIncludedIndex={}, term={}, 压缩 {} 条, firstIndex={}",
+                    index, term, removed, raftLog.firstIndex());
+        });
     }
 
     // ==================== 选举（状态线程） ====================
@@ -679,7 +1111,7 @@ public final class RaftNode implements Closeable {
             return;
         }
         VoteRequest request = new VoteRequest(newTerm, nodeId,
-                raftLog.lastIndex(), raftLog.lastTerm());
+                raftLog.lastIndex(), localLastLogTerm());
         for (ClusterMember peer : members) {
             if (peer.getNodeId().equals(nodeId)) {
                 continue;
@@ -742,6 +1174,9 @@ public final class RaftNode implements Closeable {
             // D5：step-down 丢弃在途水位——在途写一律失败，客户端重试新 leader
             failWaiters(new PolyConfigException(ErrorCode.UNAVAILABLE,
                     "leader 已退位，在途写未提交，请重试"));
+            // CP-4：在途线性读全部作废（选举窗口不回退），客户端重试新 leader
+            failPendingReads(new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "leader 已切换，线性读作废，请重试"));
         }
         resetElectionTimer();
         updateViews();
@@ -801,12 +1236,21 @@ public final class RaftNode implements Closeable {
                 broken = true;
                 failWaiters(new PolyConfigException(ErrorCode.STORAGE_ERROR,
                         "状态机 apply 失败: index=" + next, e));
+                failPendingReads(new PolyConfigException(ErrorCode.UNAVAILABLE,
+                        "节点已 fail-stop，请重启恢复"));
                 return;
             }
             lastApplied = next;
+            lastAppliedView = lastApplied;
             CompletableFuture<Long> waiter = applyWaiters.remove(next);
             if (waiter != null) {
                 waiter.complete(next);
+            }
+        }
+        // apply 推进后放行已确认领导权、基线被覆盖的线性读
+        if (!pendingReads.isEmpty()) {
+            for (PendingRead read : new ArrayList<>(pendingReads)) {
+                tryCompleteRead(read);
             }
         }
     }
@@ -847,6 +1291,7 @@ public final class RaftNode implements Closeable {
     /**
      * 给单个 follower 组装并发送 AppendEntries（状态线程）：
      * prev 凭据取 nextIndex-1 的接缝，条目取 [nextIndex, lastIndex] 的批量切片。
+     * 本地日志已无法组装（回退触到快照边界）时改发 InstallSnapshot。
      *
      * @param peer 目标 follower
      */
@@ -855,12 +1300,16 @@ public final class RaftNode implements Closeable {
             return;
         }
         long next = nextIndex.getOrDefault(peer.getNodeId(), raftLog.lastIndex() + 1);
+        if (!canServeFrom(next)) {
+            sendSnapshotTo(peer);
+            return;
+        }
         long prev = next - 1;
         AppendEntriesRequest request = new AppendEntriesRequest();
         request.setTerm(metaStore.currentTerm());
         request.setLeaderId(nodeId);
         request.setPrevLogIndex(prev);
-        request.setPrevLogTerm(prev == 0 ? 0 : raftLog.termAt(prev));
+        request.setPrevLogTerm(prevLogTerm(prev));
         request.setLeaderCommit(commitIndex);
         List<LogEntryData> entries = new ArrayList<>();
         long lastIndex = raftLog.lastIndex();
@@ -873,6 +1322,80 @@ public final class RaftNode implements Closeable {
         request.setEntries(entries);
         transport.sendAppend(peer, request,
                 resp -> deliverAppendResponse(peer.getNodeId(), resp));
+    }
+
+    /**
+     * 本地日志能否从 nextIndex 组装 AppendEntries（状态线程）。
+     *
+     * <p>需要：条目区 [next, lastIndex] 都可读（next ≥ firstIndex），
+     * 且接缝 prev 的 term 已知（prev=0、prev 在日志内、或 prev 正是快照
+     * 位点——term 由快照元数据补上）。不满足则须整份下发快照。</p>
+     *
+     * @param next 该 follower 的下一条待发 index
+     * @return 是否可直接组装
+     */
+    private boolean canServeFrom(long next) {
+        if (next < 1) {
+            return false;
+        }
+        long first = raftLog.firstIndex();
+        if (next < first) {
+            return false;
+        }
+        long prev = next - 1;
+        if (prev == 0) {
+            return true;
+        }
+        if (prev >= first) {
+            return prev <= raftLog.lastIndex();
+        }
+        return prev == snapshotIndex;
+    }
+
+    /**
+     * 组装接缝 term（状态线程；{@link #canServeFrom} 已保证可解析）。
+     *
+     * @param prev 接缝 index
+     * @return 接缝 term
+     */
+    private long prevLogTerm(long prev) {
+        if (prev == 0) {
+            return 0L;
+        }
+        if (prev >= raftLog.firstIndex() && prev <= raftLog.lastIndex()) {
+            return raftLog.termAt(prev);
+        }
+        // 只可能是快照边界（canServeFrom 校验过）
+        return snapshotTerm;
+    }
+
+    /**
+     * 整份下发快照给落后 follower（状态线程）：快照取自协议层持久化的
+     * 最新文件，位点以快照自身元数据为准。
+     *
+     * @param peer 目标 follower
+     */
+    private void sendSnapshotTo(ClusterMember peer) {
+        if (closed || role != RaftRole.LEADER || snapshotAccess == null) {
+            return;
+        }
+        SnapshotData data = snapshotAccess.currentSnapshot();
+        if (data == null || data.getLastIncludedIndex() <= 0) {
+            // 回退触界但无快照可发（理论上仅快照尚未落盘的窗口）：等落盘后下轮心跳再试
+            log.debug("触到快照边界但暂无快照可发: peer={}, firstIndex={}",
+                    peer.getNodeId(), raftLog.firstIndex());
+            return;
+        }
+        SnapshotRequest request = new SnapshotRequest();
+        request.setTerm(metaStore.currentTerm());
+        request.setLeaderId(nodeId);
+        request.setLastIncludedIndex(data.getLastIncludedIndex());
+        request.setLastIncludedTerm(data.getLastIncludedTerm());
+        request.setSnapshot(JsonUtils.toJson(data));
+        log.info("下发 InstallSnapshot: peer={}, lastIncludedIndex={}, lastIncludedTerm={}",
+                peer.getNodeId(), data.getLastIncludedIndex(), data.getLastIncludedTerm());
+        transport.sendSnapshot(peer, request,
+                resp -> deliverSnapshotResponse(peer.getNodeId(), resp));
     }
 
     // ==================== 计时器与信箱（状态线程） ====================
@@ -934,6 +1457,8 @@ public final class RaftNode implements Closeable {
         termView = metaStore.currentTerm();
         leaderIdView = leaderId;
         commitIndexView = commitIndex;
+        snapshotIndexView = snapshotIndex;
+        lastAppliedView = lastApplied;
     }
 
     private void recordPeerSeen(String peerId) {
@@ -944,6 +1469,16 @@ public final class RaftNode implements Closeable {
 
     private int majority() {
         return members.size() / 2 + 1;
+    }
+
+    /**
+     * 本节点日志尾 term（状态线程）：空日志时为快照位点的 term——
+     * 快照是一条伪日志条目，参与"日志够新"比较与选举自报。
+     *
+     * @return 日志尾 term
+     */
+    private long localLastLogTerm() {
+        return raftLog.isEmpty() ? snapshotTerm : raftLog.lastTerm();
     }
 
     private ClusterMember memberById(String peerId) {

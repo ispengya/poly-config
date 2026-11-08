@@ -9,7 +9,6 @@ import com.ispengya.polyconfig.common.model.ConfigConstants;
 import com.ispengya.polyconfig.common.model.ConfigEntry;
 import com.ispengya.polyconfig.common.model.ConfigKey;
 import com.ispengya.polyconfig.common.model.ConfigOperation;
-import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import com.ispengya.polyconfig.common.model.MutationResult;
 import com.ispengya.polyconfig.common.protocol.VerifyEntry;
@@ -20,9 +19,6 @@ import com.ispengya.polyconfig.core.workspace.WorkspaceRegistry;
 import com.ispengya.polyconfig.storage.log.SegmentLog;
 import com.ispengya.polyconfig.storage.log.SegmentLogConfig;
 import com.ispengya.polyconfig.storage.snapshot.SnapshotData;
-import com.ispengya.polyconfig.storage.snapshot.SnapshotEntry;
-import com.ispengya.polyconfig.storage.snapshot.SnapshotHistory;
-import com.ispengya.polyconfig.storage.snapshot.SnapshotHistoryItem;
 import com.ispengya.polyconfig.storage.snapshot.SnapshotStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -464,49 +460,8 @@ public class LocalEngine {
     }
 
     private SnapshotData captureLocked() {
-        SnapshotData data = new SnapshotData();
-        data.setRevision(revision);
-        List<SnapshotEntry> entries = new ArrayList<>();
-        for (ConfigEntry entry : stateMachine.exportEntries()) {
-            SnapshotEntry row = new SnapshotEntry();
-            row.setNamespace(entry.getKey().getNamespace());
-            row.setGroup(entry.getKey().getGroup());
-            row.setDataId(entry.getKey().getDataId());
-            row.setContent(entry.getContent());
-            row.setType(entry.getType() == null ? null : entry.getType().name());
-            row.setMd5(entry.getMd5());
-            row.setVersion(entry.getVersion());
-            row.setRevision(entry.getRevision());
-            row.setCreatedTime(entry.getCreatedTime());
-            row.setModifiedTime(entry.getModifiedTime());
-            row.setOperator(entry.getOperator());
-            entries.add(row);
-        }
-        data.setEntries(entries);
-        List<SnapshotHistory> histories = new ArrayList<>();
-        for (Map.Entry<ConfigKey, List<HistoryEntry>> entry
-                : stateMachine.exportHistories().entrySet()) {
-            SnapshotHistory history = new SnapshotHistory();
-            history.setNamespace(entry.getKey().getNamespace());
-            history.setGroup(entry.getKey().getGroup());
-            history.setDataId(entry.getKey().getDataId());
-            List<SnapshotHistoryItem> items = new ArrayList<>();
-            for (HistoryEntry item : entry.getValue()) {
-                SnapshotHistoryItem row = new SnapshotHistoryItem();
-                row.setRevision(item.getRevision());
-                row.setOperation(item.getOperation() == null ? null : item.getOperation().name());
-                row.setContent(item.getContent());
-                row.setType(item.getType() == null ? null : item.getType().name());
-                row.setMd5(item.getMd5());
-                row.setOperator(item.getOperator());
-                row.setTimestamp(item.getTimestamp());
-                items.add(row);
-            }
-            history.setItems(items);
-            histories.add(history);
-        }
-        data.setHistories(histories);
-        return data;
+        // 快照捕获统一走状态机导出（CP 同一套零件，lastIncluded 由 CP 填写）
+        return stateMachine.exportSnapshot(revision, 0L, 0L);
     }
 
     private void persistSnapshot(SnapshotData data, long capturedRevision,
@@ -625,40 +580,11 @@ public class LocalEngine {
     }
 
     private static List<ConfigEntry> toEntries(SnapshotData snapshot) {
-        List<ConfigEntry> entries = new ArrayList<>();
-        if (snapshot.getEntries() == null) {
-            return entries;
-        }
-        for (SnapshotEntry row : snapshot.getEntries()) {
-            ConfigKey key = new ConfigKey(row.getNamespace(), row.getGroup(), row.getDataId());
-            entries.add(new ConfigEntry(key, row.getContent(),
-                    ConfigType.from(row.getType()), row.getMd5(),
-                    row.getVersion(), row.getRevision(),
-                    row.getCreatedTime(), row.getModifiedTime(), row.getOperator()));
-        }
-        return entries;
+        return snapshot.toEntries();
     }
 
     private static Map<ConfigKey, List<HistoryEntry>> toHistories(SnapshotData snapshot) {
-        Map<ConfigKey, List<HistoryEntry>> result = new java.util.HashMap<>();
-        if (snapshot.getHistories() == null) {
-            return result;
-        }
-        for (SnapshotHistory history : snapshot.getHistories()) {
-            ConfigKey key = new ConfigKey(history.getNamespace(), history.getGroup(),
-                    history.getDataId());
-            List<HistoryEntry> items = new ArrayList<>();
-            if (history.getItems() != null) {
-                for (SnapshotHistoryItem row : history.getItems()) {
-                    items.add(new HistoryEntry(key, row.getRevision(),
-                            ConfigOperation.valueOf(row.getOperation()), row.getContent(),
-                            ConfigType.from(row.getType()),
-                            row.getMd5(), row.getOperator(), row.getTimestamp()));
-                }
-            }
-            result.put(key, items);
-        }
-        return result;
+        return snapshot.toHistories();
     }
 
     private static ThreadFactory daemonFactory(String prefix) {

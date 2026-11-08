@@ -7,6 +7,7 @@ import com.ispengya.polyconfig.common.protocol.AppendEntriesResponse;
 import com.ispengya.polyconfig.common.protocol.VoteRequest;
 import com.ispengya.polyconfig.common.protocol.VoteResponse;
 import com.ispengya.polyconfig.consistency.ClusterMember;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotData;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -26,9 +27,10 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * {@link RaftNode} 单元测试（CP-2/CP-3 验收：投票决策矩阵、规则一/规则二、
- * 单节点选举与写入、三节点唯一 leader 与换代、多节点复制提交、
- * nextIndex 回退追平、图 8 旧 term 未提交条目不 apply）。
+ * {@link RaftNode} 单元测试（CP-2/CP-3/CP-4 验收：投票决策矩阵、规则一/
+ * 规则二、单节点选举与写入、三节点唯一 leader 与换代、多节点复制提交、
+ * nextIndex 回退追平、图 8 旧 term 未提交条目不 apply、read-index 线性读、
+ * InstallSnapshot 追平）。
  */
 public class RaftNodeTest {
 
@@ -485,11 +487,165 @@ public class RaftNodeTest {
         }
     }
 
+    // ==================== CP-4 read-index 与 InstallSnapshot ====================
+
+    @Test
+    public void shouldCompleteReadIndexOnLeaderAndRejectOnFollower() throws Exception {
+        DirectNetwork network = new DirectNetwork();
+        List<RaftNode> nodes = new ArrayList<>();
+        try {
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, new CopyOnWriteArrayList<>(), null, 0L);
+                network.register(id, node);
+                nodes.add(node);
+                node.start();
+            }
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "三节点应选出唯一 leader");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+            RaftNode follower = nodes.stream().filter(n -> n != leader).findFirst().get();
+
+            // leader：确认轮完成，基线被状态机覆盖
+            long readIndex = leader.readIndex().get(3, TimeUnit.SECONDS);
+            assertTrue("readIndex 应覆盖已提交位点: " + readIndex, readIndex >= 1);
+            assertTrue("完成时 lastApplied 应覆盖基线", leader.lastApplied() >= readIndex);
+
+            // follower：角色闸拒绝（UNAVAILABLE，不返回任何值）
+            try {
+                follower.readIndex().get(3, TimeUnit.SECONDS);
+                fail("follower 的 read-index 应被拒绝");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof PolyConfigException);
+                assertEquals(ErrorCode.UNAVAILABLE,
+                        ((PolyConfigException) e.getCause()).getErrorCode());
+            }
+        } finally {
+            for (RaftNode node : nodes) {
+                node.close();
+            }
+        }
+    }
+
+    @Test
+    public void shouldFailReadIndexWhenLeaderIsolated() throws Exception {
+        // 多数派不可达：确认轮凑不齐 → 超时失败而非回退读旧值
+        DirectNetwork network = new DirectNetwork();
+        List<RaftNode> nodes = new ArrayList<>();
+        String isolatedId = null;
+        try {
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, new CopyOnWriteArrayList<>(), null, 0L);
+                network.register(id, node);
+                nodes.add(node);
+                node.start();
+            }
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "三节点应选出唯一 leader");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+            isolatedId = leader.nodeId();
+            network.isolate(isolatedId);
+
+            try {
+                leader.readIndex().get(5, TimeUnit.SECONDS);
+                fail("孤立 leader 的 read-index 应失败（凑不齐多数派确认）");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof PolyConfigException);
+                assertEquals(ErrorCode.UNAVAILABLE,
+                        ((PolyConfigException) e.getCause()).getErrorCode());
+            }
+        } finally {
+            if (isolatedId != null) {
+                network.heal(isolatedId);
+            }
+            for (RaftNode node : nodes) {
+                node.close();
+            }
+        }
+    }
+
+    @Test
+    public void shouldCatchUpLaggardViaInstallSnapshot() throws Exception {
+        DirectNetwork network = new DirectNetwork();
+        List<RaftNode> nodes = new ArrayList<>();
+        List<List<byte[]>> appliedAll = new ArrayList<>();
+        List<StubSnapshotAccess> accesses = new ArrayList<>();
+        try {
+            // n3 落在后面：不注册不启动（空日志，且落后于 leader 的快照边界）
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                List<byte[]> applied = new CopyOnWriteArrayList<>();
+                StubSnapshotAccess access = new StubSnapshotAccess();
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, applied, null, 0L, access);
+                if (!id.equals("n3")) {
+                    network.register(id, node);
+                    node.start();
+                }
+                nodes.add(node);
+                appliedAll.add(applied);
+                accesses.add(access);
+            }
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "两存活节点应选出 leader（2/3 多数）");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+            int leaderIndex = nodes.indexOf(leader);
+
+            for (int i = 1; i <= 5; i++) {
+                final int n = i;
+                leader.propose(next ->
+                        ("snap-write-" + n).getBytes(StandardCharsets.UTF_8))
+                        .get(3, TimeUnit.SECONDS);
+            }
+            // no-op 占 1 号，业务写 2..6 → 快照压到 5（覆盖 2..5）
+            long snapshotIndex = 5L;
+            long snapshotTerm = leader.testTermAt(snapshotIndex);
+            SnapshotData data = new SnapshotData();
+            data.setRevision(snapshotIndex);
+            data.setLastIncludedIndex(snapshotIndex);
+            data.setLastIncludedTerm(snapshotTerm);
+            data.setEntries(new ArrayList<>());
+            data.setHistories(new ArrayList<>());
+            accesses.get(leaderIndex).data = data;
+            leader.advanceSnapshot(snapshotIndex, snapshotTerm);
+            leader.awaitStateIdle();
+            assertTrue("leader 快照位点应推进", leader.snapshotIndex() >= snapshotIndex);
+
+            // n3 加入：nextIndex 回退触到快照边界 → InstallSnapshot → 追平
+            RaftNode laggard = nodes.get(2);
+            network.register("n3", laggard);
+            laggard.start();
+            awaitTrue(() -> laggard.snapshotIndex() == snapshotIndex,
+                    5000L, "落后的 n3 应安装快照");
+            awaitTrue(() -> containsPayload(appliedAll.get(2), "snap-write-5"),
+                    5000L, "n3 应经快照边界后继续追日志并 apply");
+            awaitTrue(() -> laggard.testLastIndex() == leader.testLastIndex(),
+                    5000L, "n3 日志尾应追平 leader");
+            assertEquals(snapshotIndex, laggard.snapshotIndex());
+            assertTrue("快照覆盖的业务写不再走 apply 流（由快照状态承载）",
+                    !containsPayload(appliedAll.get(2), "snap-write-1"));
+        } finally {
+            for (RaftNode node : nodes) {
+                node.close();
+            }
+        }
+    }
+
     // ==================== 辅助 ====================
 
     private RaftNode newNode(String nodeId, String[] memberIds, DirectNetwork network,
                              List<byte[]> applied, RaftLog existingLog,
                              long recoveryCommit) {
+        return newNode(nodeId, memberIds, network, applied, existingLog,
+                recoveryCommit, null);
+    }
+
+    private RaftNode newNode(String nodeId, String[] memberIds, DirectNetwork network,
+                             List<byte[]> applied, RaftLog existingLog,
+                             long recoveryCommit, RaftSnapshotAccess snapshotAccess) {
         StringBuilder members = new StringBuilder();
         for (int i = 0; i < memberIds.length; i++) {
             if (i > 0) {
@@ -508,9 +664,37 @@ public class RaftNodeTest {
             return new RaftNode(nodeId, memberList, log, metaStore,
                     network.viewOf(nodeId),
                     (index, term, payload) -> applied.add(payload.clone()),
-                    ELECTION_TIMEOUT, HEARTBEAT, recoveryCommit);
+                    ELECTION_TIMEOUT, HEARTBEAT, recoveryCommit,
+                    0L, 0L, snapshotAccess);
         } catch (java.io.IOException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    private static boolean containsPayload(List<byte[]> applied, String expected) {
+        for (byte[] payload : applied) {
+            if (expected.equals(new String(payload, StandardCharsets.UTF_8))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 测试用快照访问口：leader 侧由测试注入待下发快照，follower 侧记录安装结果。
+     */
+    private static final class StubSnapshotAccess implements RaftSnapshotAccess {
+
+        private volatile SnapshotData data;
+
+        @Override
+        public SnapshotData currentSnapshot() {
+            return data;
+        }
+
+        @Override
+        public void installSnapshot(SnapshotData snapshot) {
+            this.data = snapshot;
         }
     }
 

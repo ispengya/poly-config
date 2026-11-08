@@ -21,6 +21,8 @@ import com.ispengya.polyconfig.server.remoting.DistroVerifyProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftAppendProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftForwardProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftReadProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftSnapshotProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftVoteProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -163,7 +165,8 @@ public class PolyConfigServer {
                     remotingExecutor);
         }
         if (protocol instanceof RaftProtocol) {
-            // CP 内部协议（4xxx）：拉票、复制/心跳与写转发，消息一律进 RaftNode 单线程信箱
+            // CP 内部协议（4xxx）：拉票、复制/心跳、写转发、快照与线性读，
+            // 消息一律进 RaftNode 单线程信箱
             RaftProtocol raftProtocol = (RaftProtocol) protocol;
             RaftNode raftNode = raftProtocol.raftNode();
             this.remotingServer.registerProcessor(ProtocolCodes.RAFT_VOTE,
@@ -173,6 +176,12 @@ public class PolyConfigServer {
             // 写转发（leader 侧）：非 leader 节点的写经此到达 leader
             this.remotingServer.registerProcessor(ProtocolCodes.RAFT_FORWARD,
                     new RaftForwardProcessor(raftProtocol), remotingExecutor);
+            // 快照下发（CP-4）：落后太多的 follower 整份接收
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_SNAPSHOT,
+                    new RaftSnapshotProcessor(raftNode), remotingExecutor);
+            // 线性读（CP-4）：任意节点 → leader，read-index 在 leader 侧完成
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_READ,
+                    new RaftReadProcessor(raftProtocol), remotingExecutor);
         }
 
         this.changePusher = new ChangePusher(remotingServer, registry);
@@ -312,6 +321,15 @@ public class PolyConfigServer {
      */
     public ConfigService getConfigService() {
         return configService;
+    }
+
+    /**
+     * 返回一致性协议（测试/诊断用：CP 线性读等协议级入口）。
+     *
+     * @return 一致性协议
+     */
+    public ConfigProtocol getProtocol() {
+        return protocol;
     }
 
     private String resolveAdvertisedHost() {

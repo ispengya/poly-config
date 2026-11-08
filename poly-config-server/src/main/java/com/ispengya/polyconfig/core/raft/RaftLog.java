@@ -178,12 +178,14 @@ public final class RaftLog implements Closeable {
     }
 
     /**
-     * 压缩已覆盖的前缀：删除物理完整段并修剪内存表。
+     * 压缩已覆盖的前缀：删除物理完整段并按覆盖位点修剪内存表。
      *
-     * <p>仅删除"段末尾 &lt;= coveredUpTo"的完整段（活跃段永不删），
-     * 因此 coveredIndex 与最后一个保留记录之间可能残留若干物理记录——
-     * 重启扫描后 firstIndex 可能比本方法返回时略小，属预期：
-     * 调用方（RaftNode）以快照 lastIncludedIndex 为准忽略这些条目。</p>
+     * <p>物理层只删除"段末尾 &lt;= coveredUpTo"的完整段（活跃段永不删），
+     * 内存表则一律裁剪到 {@code firstIndex = coveredIndex + 1}——运行期
+     * 覆盖区间不可读、复制回退触到边界即转 InstallSnapshot。物理残留
+     * （覆盖区间尾部的未满段记录）只在重启扫描时重现，此时 firstIndex
+     * 可能比本方法返回时略小，由调用方以快照 lastIncludedIndex 为准
+     * 忽略（apply 从快照位点之后开始，闸2 对快照边界单独核对）。</p>
      *
      * @param coveredIndex 快照已覆盖到的 index（含）
      * @return 从内存表移除的条目数（物理删除的段数见段日志日志）
@@ -200,9 +202,8 @@ public final class RaftLog implements Closeable {
                 : segmentLog.getMaxOffset();
         segmentLog.deleteSegmentsBefore(coveredUpTo);
 
-        long minOffset = segmentLog.getMinOffset();
         int removed = 0;
-        while (!offsets.isEmpty() && offsets.get(0) < minOffset) {
+        while (!offsets.isEmpty() && firstIndex <= capped) {
             offsets.remove(0);
             terms.remove(0);
             firstIndex++;
@@ -213,6 +214,40 @@ public final class RaftLog implements Closeable {
                     coveredIndex, removed, firstIndex);
         }
         return removed;
+    }
+
+    /**
+     * 整表丢弃全部保留条目（物理与内存同步清空），{@code firstIndex} 坐标不变。
+     *
+     * <p>InstallSnapshot 与"冲突点恰在保留起点"的整段覆盖用：清空后追加
+     * 自动落在 {@code firstIndex}，与冲突条目的 index 对齐。物理清空后
+     * 重启的空日志以快照位点重建起点（调用方恢复规则负责）。</p>
+     */
+    public synchronized void discardAll() {
+        // 物理清空（含内存已空时压缩残留的未满段记录）+ 内存清空
+        segmentLog.truncateTo(0L);
+        offsets.clear();
+        terms.clear();
+    }
+
+    /**
+     * 安装快照后的日志重置：整表清空并把起点对齐到快照边界。
+     *
+     * <p>覆盖区间及冲突尾巴全部丢弃，下一条追加落在
+     * {@code lastIncludedIndex + 1}——follower 整份接收快照、恢复期发现
+     * 日志落后于快照位点时使用。</p>
+     *
+     * @param lastIncludedIndex 快照覆盖到的最后一条 index（含）
+     */
+    public synchronized void resetToSnapshot(long lastIncludedIndex) {
+        if (lastIncludedIndex < 0) {
+            throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                    "快照位点不能为负: " + lastIncludedIndex);
+        }
+        discardAll();
+        firstIndex = lastIncludedIndex + 1;
+        log.info("Raft 日志重置到快照边界: lastIncludedIndex={}, firstIndex={}",
+                lastIncludedIndex, firstIndex);
     }
 
     /**

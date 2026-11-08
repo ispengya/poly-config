@@ -14,6 +14,10 @@ import com.ispengya.polyconfig.common.protocol.VerifyEntry;
 import com.ispengya.polyconfig.common.util.Md5Utils;
 import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.StateMachine;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotData;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotEntry;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotHistory;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotHistoryItem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -276,6 +280,62 @@ public class ConfigStateMachine implements StateMachine {
             }
         }
         return result;
+    }
+
+    /**
+     * 捕获当前状态为快照（供 AP/CP 快照写入，状态线程或写锁内调用）。
+     *
+     * @param revision 快照对应的变更序号（AP = 全局 revision；CP = raft index）
+     * @param lastIncludedIndex CP：快照覆盖到的 Raft 日志 index（AP 传 0）
+     * @param lastIncludedTerm CP：快照覆盖到的 Raft 日志 term（AP 传 0）
+     * @return 快照内容（entries + histories 已填充）
+     */
+    public synchronized SnapshotData exportSnapshot(long revision, long lastIncludedIndex,
+                                                    long lastIncludedTerm) {
+        SnapshotData data = new SnapshotData();
+        data.setRevision(revision);
+        data.setLastIncludedIndex(lastIncludedIndex);
+        data.setLastIncludedTerm(lastIncludedTerm);
+        List<SnapshotEntry> rows = new ArrayList<>();
+        for (ConfigEntry entry : current.values()) {
+            SnapshotEntry row = new SnapshotEntry();
+            row.setNamespace(entry.getKey().getNamespace());
+            row.setGroup(entry.getKey().getGroup());
+            row.setDataId(entry.getKey().getDataId());
+            row.setContent(entry.getContent());
+            row.setType(entry.getType() == null ? null : entry.getType().name());
+            row.setMd5(entry.getMd5());
+            row.setVersion(entry.getVersion());
+            row.setRevision(entry.getRevision());
+            row.setCreatedTime(entry.getCreatedTime());
+            row.setModifiedTime(entry.getModifiedTime());
+            row.setOperator(entry.getOperator());
+            rows.add(row);
+        }
+        data.setEntries(rows);
+        List<SnapshotHistory> historyRows = new ArrayList<>();
+        for (Map.Entry<ConfigKey, List<HistoryEntry>> entry : exportHistories().entrySet()) {
+            SnapshotHistory history = new SnapshotHistory();
+            history.setNamespace(entry.getKey().getNamespace());
+            history.setGroup(entry.getKey().getGroup());
+            history.setDataId(entry.getKey().getDataId());
+            List<SnapshotHistoryItem> items = new ArrayList<>();
+            for (HistoryEntry item : entry.getValue()) {
+                SnapshotHistoryItem row = new SnapshotHistoryItem();
+                row.setRevision(item.getRevision());
+                row.setOperation(item.getOperation() == null ? null : item.getOperation().name());
+                row.setContent(item.getContent());
+                row.setType(item.getType() == null ? null : item.getType().name());
+                row.setMd5(item.getMd5());
+                row.setOperator(item.getOperator());
+                row.setTimestamp(item.getTimestamp());
+                items.add(row);
+            }
+            history.setItems(items);
+            historyRows.add(history);
+        }
+        data.setHistories(historyRows);
+        return data;
     }
 
     /**

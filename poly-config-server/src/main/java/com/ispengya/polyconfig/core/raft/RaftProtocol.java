@@ -11,6 +11,8 @@ import com.ispengya.polyconfig.common.model.ConfigOperation;
 import com.ispengya.polyconfig.common.model.ConfigType;
 import com.ispengya.polyconfig.common.model.HistoryEntry;
 import com.ispengya.polyconfig.common.model.MutationResult;
+import com.ispengya.polyconfig.common.protocol.ConfigView;
+import com.ispengya.polyconfig.common.protocol.ForwardReadRequest;
 import com.ispengya.polyconfig.common.protocol.ForwardWriteRequest;
 import com.ispengya.polyconfig.common.protocol.ForwardWriteResult;
 import com.ispengya.polyconfig.common.protocol.ProtocolCodes;
@@ -26,6 +28,8 @@ import com.ispengya.polyconfig.consistency.NodeStatus;
 import com.ispengya.polyconfig.consistency.ProtocolMode;
 import com.ispengya.polyconfig.consistency.ReadConsistency;
 import com.ispengya.polyconfig.core.state.ConfigStateMachine;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotData;
+import com.ispengya.polyconfig.storage.snapshot.SnapshotStore;
 import com.ispengya.remoting.netty.NettyRemotingClient;
 import com.ispengya.remoting.protocol.RemotingCommand;
 import org.slf4j.Logger;
@@ -42,6 +46,9 @@ import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,12 +75,22 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code LocalEngine} 的 propose 编排不复用——"追加即生效"与"commit 才
  * 生效"是两种编排（决策 D10/LocEngine 关系见设计文档 §10）。</p>
  *
- * <p>恢复（CP-2 范围，无快照）：单成员集群日志即权威，构造时把
- * commitIndex 置为 lastIndex 并立即 apply，重启后读路径无空窗；多成员
- * 为 0，等 leader 的 AppendEntries 重新提交（CP-3 起 leaderCommit 传播），
- * 此间 LOCAL 读为空窗、LINEARIZABLE 转发 leader 可读到已提交值。</p>
+ * <p>恢复（CP-4 起含快照）：加载最新 CP 快照（lastIncludedIndex/Term）
+ * 恢复状态机，日志保留快照之后的增量（落后于快照则整表重置对齐边界）；
+ * 单成员集群日志即权威，构造时把 commitIndex 置为 lastIndex 并把
+ * (快照位点, commitIndex] apply 进状态机，重启后读路径无空窗；多成员
+ * 为快照位点，等 leader 的 AppendEntries 重新提交。</p>
+ *
+ * <p>CP-4 快照编排：apply 计数达 {@code snapshotThreshold} 时在状态线程
+ * 捕获状态（位点 = 当前 apply 的 index/term）→ 异步原子写
+ * {@link SnapshotStore} → 成功后通知 RaftNode 压缩日志前缀；InstallSnapshot
+ * 安装时先持久化文件再恢复状态机（任一时刻崩溃可确定性恢复）。</p>
+ *
+ * <p>CP-4 线性读：LINEARIZABLE 非 leader 经 RAFT_READ 转发 leader，
+ * leader 侧完成 read-index（基线 + 心跳轮确认 + 等 apply）后读状态机返回；
+ * 选举窗口/分区下失败（UNAVAILABLE）而非回退。</p>
  */
-public class RaftProtocol implements ConfigProtocol {
+public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
 
     private static final Logger log = LoggerFactory.getLogger(RaftProtocol.class);
 
@@ -134,6 +151,41 @@ public class RaftProtocol implements ConfigProtocol {
      */
     private final long forwardTimeoutMillis;
 
+    /**
+     * 线性读等待：须大于 RaftNode 内部的 read-index 确认超时。
+     */
+    private final long readTimeoutMillis;
+
+    /**
+     * 快照存储（CP-4：携带 lastIncludedIndex/Term，复用 AP 的原子写/保留 2 份）。
+     */
+    private final SnapshotStore snapshotStore;
+
+    /**
+     * 快照触发阈值（apply 的命令条数），0 = 关闭快照。
+     */
+    private final int snapshotThreshold;
+
+    /**
+     * 快照异步写线程（捕获在状态线程，落盘在本线程）。
+     */
+    private final ExecutorService snapshotExecutor;
+
+    /**
+     * 最近一次持久化的 CP 快照（volatile：状态线程写、快照下发线程读）。
+     */
+    private volatile SnapshotData latestSnapshot;
+
+    /**
+     * 距上次快照已 apply 的命令数（状态线程写，快照线程清零）。
+     */
+    private volatile int commandsSinceSnapshot;
+
+    /**
+     * 快照写在途（防止并发触发；捕获-落盘期间新 apply 继续计数）。
+     */
+    private volatile boolean snapshotInFlight;
+
     private volatile String host = "";
 
     private volatile int httpPort;
@@ -149,7 +201,7 @@ public class RaftProtocol implements ConfigProtocol {
      * @param nodeId 节点 ID
      * @param clusterId 集群 ID
      * @param historyLimit 历史保留条数
-     * @param snapshotThreshold 快照阈值（CP-4 接入；CP-2 阶段忽略）
+     * @param snapshotThreshold 快照阈值（apply 条数），0 = 关闭快照
      * @param members 静态成员列表，不可为空且必须包含本节点
      * @param electionTimeoutMillis 选举超时基数（随机 [t, 2t)）
      * @param heartbeatMillis 心跳周期
@@ -173,10 +225,43 @@ public class RaftProtocol implements ConfigProtocol {
         this.members = java.util.Collections.unmodifiableList(
                 new ArrayList<>(members));
         this.stateMachine = new ConfigStateMachine(historyLimit);
+        this.snapshotThreshold = Math.max(0, snapshotThreshold);
+        this.snapshotStore = new SnapshotStore(dataDir.resolve("snapshot"));
+        this.snapshotExecutor = this.snapshotThreshold > 0
+                ? Executors.newSingleThreadExecutor(r -> {
+                    Thread thread = new Thread(r,
+                            "poly-config-raft-snapshot-" + nodeId);
+                    thread.setDaemon(true);
+                    return thread;
+                }) : null;
 
         Path raftDir = dataDir.resolve("raft");
         this.metaStore = new RaftMetaStore(raftDir.resolve("meta.json"));
         this.raftLog = new RaftLog(raftDir.resolve("log"));
+
+        // CP 快照恢复（lastIncluded>0 才是 CP 快照；AP 遗留快照忽略）
+        SnapshotData snapshot = this.snapshotStore.loadLatest();
+        long snapshotIndex = 0L;
+        long snapshotTerm = 0L;
+        if (snapshot != null && snapshot.getLastIncludedIndex() > 0) {
+            snapshotIndex = snapshot.getLastIncludedIndex();
+            snapshotTerm = snapshot.getLastIncludedTerm();
+            if (raftLog.lastIndex() < snapshotIndex) {
+                // 日志落后于快照（安装中崩溃/整表已丢）：对齐快照边界
+                raftLog.resetToSnapshot(snapshotIndex);
+            } else {
+                // 保留快照之后的日志增量，压掉覆盖前缀
+                raftLog.compactBefore(snapshotIndex);
+            }
+            stateMachine.restore(snapshot.toEntries(), snapshot.toHistories());
+            this.latestSnapshot = snapshot;
+            this.logAppliedRevision = snapshotIndex;
+            log.info("CP 快照恢复: lastIncludedIndex={}, lastIncludedTerm={}, 日志范围=[{},{}]",
+                    snapshotIndex, snapshotTerm, raftLog.firstIndex(), raftLog.lastIndex());
+        } else if (snapshot != null) {
+            log.warn("发现非 CP 快照（lastIncludedIndex=0），忽略并按日志恢复: revision={}",
+                    snapshot.getRevision());
+        }
 
         this.remotingClient = new NettyRemotingClient();
         long rpcTimeout = Math.max(RPC_TIMEOUT_MIN_MILLIS,
@@ -184,12 +269,15 @@ public class RaftProtocol implements ConfigProtocol {
         this.transport = new RemotingRaftTransport(remotingClient, rpcTimeout,
                 Math.max(2, members.size()));
 
-        // 恢复提交位点：单成员日志即权威（已应答写一条不少），多成员等 leader
+        // 恢复提交位点：单成员日志即权威（已应答写一条不少），多成员等 leader；
+        // 两者都以快照位点为 apply 起点
         long recoveryCommit = members.size() == 1 ? raftLog.lastIndex() : 0L;
         this.raftNode = new RaftNode(nodeId, this.members, raftLog, metaStore, transport,
-                this::onApply, electionTimeoutMillis, heartbeatMillis, recoveryCommit);
+                this::onApply, electionTimeoutMillis, heartbeatMillis, recoveryCommit,
+                snapshotIndex, snapshotTerm, this);
         this.proposeTimeoutMillis = Math.max(3_000L, 3 * electionTimeoutMillis);
         this.forwardTimeoutMillis = proposeTimeoutMillis + 1_000L;
+        this.readTimeoutMillis = Math.max(1_000L, 2 * electionTimeoutMillis) + 1_000L;
         if (recoveryCommit > 0) {
             log.info("单成员恢复: commitIndex={}, 日志范围=[{},{}]", recoveryCommit,
                     raftLog.firstIndex(), raftLog.lastIndex());
@@ -369,8 +457,120 @@ public class RaftProtocol implements ConfigProtocol {
     @Override
     public Optional<ConfigEntry> read(ConfigKey key, ReadConsistency consistency) {
         ensureOpen();
-        // CP-4：LINEARIZABLE 走 leader + read-index；CP-2 阶段两者同为本地读
+        if (consistency != ReadConsistency.LINEARIZABLE) {
+            return stateMachine.get(key);
+        }
+        // LINEARIZABLE：非 leader 经 RAFT_READ 转发，read-index 在 leader 侧完成
+        String leaderId = raftNode.leaderId();
+        if (leaderId == null || leaderId.isEmpty()) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "集群选举中，暂无 leader，请稍后重试");
+        }
+        if (leaderId.equals(nodeId)) {
+            // 视图滞后（实际已非 leader）：readIndex 的角色闸抛 UNAVAILABLE，可重试
+            return readLocalLinearizable(key);
+        }
+        ClusterMember leader = lookupMember(leaderId);
+        if (leader == null) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "leader 不在成员表中: " + leaderId);
+        }
+        return doForwardRead(leader, key);
+    }
+
+    /**
+     * leader 本机线性读（RAFT_READ 的 leader 侧入口，也是本机 LINEARIZABLE 路径）：
+     * read-index（基线 + 多数派确认 + 等 apply）完成后读本地状态机。
+     *
+     * <p>返回值 ≥ 此前已完成的全部写；选举中/分区下以 UNAVAILABLE 失败，
+     * 不返回旧值（cp-design.md §6）。</p>
+     *
+     * @param key 配置键
+     * @return 配置条目
+     */
+    public Optional<ConfigEntry> readLocalLinearizable(ConfigKey key) {
+        ensureOpen();
+        try {
+            raftNode.readIndex().get(readTimeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE, "线性读被中断");
+        } catch (TimeoutException e) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "线性读在 " + readTimeoutMillis + "ms 内未完成"
+                            + "（选举中或多数派不可达），请重试");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof PolyConfigException) {
+                throw (PolyConfigException) cause;
+            }
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE, "线性读失败", cause);
+        }
+        // readIndex 完成 = lastApplied ≥ 基线，此后读状态机只向前（happens-before
+        // 经 future 完成建立），可能更新但绝不更旧
         return stateMachine.get(key);
+    }
+
+    /**
+     * 把线性读转发给 leader（RAFT_READ，4005）：read-index 由 leader 完成，
+     * 应答携带配置视图。
+     *
+     * @param leader leader 成员
+     * @param key 配置键
+     * @return 配置条目（不存在为空）
+     */
+    private Optional<ConfigEntry> doForwardRead(ClusterMember leader, ConfigKey key) {
+        RemotingCommand request = RemotingCommand.createRequestCommand(
+                ProtocolCodes.RAFT_READ, null);
+        request.setBody(JsonUtils.toJson(
+                ForwardReadRequest.of(key.getNamespace(), key.getGroup(), key.getDataId()))
+                .getBytes(StandardCharsets.UTF_8));
+        RemotingCommand response;
+        try {
+            response = remotingClient.invokeSync(address(leader), request,
+                    readTimeoutMillis);
+        } catch (Exception e) {
+            log.warn("线性读转发失败, leader={}, key={}: {}",
+                    leader.getNodeId(), key.toPath(), e.toString());
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "leader 不可用: leader=" + leader.getNodeId()
+                            + ", key=" + key, e);
+        }
+        if (response.getCode() == ProtocolCodes.RESPONSE_NOT_FOUND) {
+            return Optional.empty();
+        }
+        if (response.getCode() != ProtocolCodes.RESPONSE_OK) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "线性读被 leader 拒绝: code=" + response.getCode()
+                            + ", " + describeResponse(response));
+        }
+        ConfigView view = JsonUtils.parseObject(
+                new String(response.getBody(), StandardCharsets.UTF_8),
+                ConfigView.class);
+        if (view == null || view.getDataId() == null) {
+            throw new PolyConfigException(ErrorCode.UNAVAILABLE, "线性读应答体非法");
+        }
+        return Optional.of(new ConfigEntry(
+                new ConfigKey(view.getNamespace(), view.getGroup(), view.getDataId()),
+                view.getContent(),
+                ConfigType.from(view.getType()),
+                view.getMd5(), view.getVersion(), view.getRevision(),
+                view.getCreatedTime(), view.getModifiedTime(), view.getOperator()));
+    }
+
+    /**
+     * 按 nodeId 查成员（成员表静态，任意线程可读）。
+     *
+     * @param memberId 节点 ID
+     * @return 成员；不在表中为 {@code null}
+     */
+    private ClusterMember lookupMember(String memberId) {
+        for (ClusterMember member : members) {
+            if (member.getNodeId().equals(memberId)) {
+                return member;
+            }
+        }
+        return null;
     }
 
     @Override
@@ -476,6 +676,9 @@ public class RaftProtocol implements ConfigProtocol {
             closed = true;
         }
         raftNode.close();
+        if (snapshotExecutor != null) {
+            snapshotExecutor.shutdownNow();
+        }
         transport.close();
         try {
             remotingClient.shutdown();
@@ -506,6 +709,69 @@ public class RaftProtocol implements ConfigProtocol {
         applyFromLog(command, index, assigned != null ? assigned : index);
         log.debug("apply 已提交条目: index={}, term={}, op={}, key={}",
                 index, term, command.getOperation(), command.getKey());
+        maybeTriggerSnapshot(index, term);
+    }
+
+    /**
+     * 快照阈值命中时在状态线程捕获状态（位点 = 当前 apply 的 index/term），
+     * 转异步线程原子落盘，成功后通知 RaftNode 压缩日志前缀。
+     *
+     * @param index 当前 apply 到的 index（= 快照 lastIncludedIndex）
+     * @param term 该 index 的 term
+     */
+    private void maybeTriggerSnapshot(long index, long term) {
+        // 构造期恢复 apply 尚无 raftNode（快照压缩无从谈起），跳过
+        if (snapshotThreshold <= 0 || snapshotExecutor == null || raftNode == null) {
+            return;
+        }
+        commandsSinceSnapshot++;
+        if (commandsSinceSnapshot < snapshotThreshold || snapshotInFlight) {
+            return;
+        }
+        SnapshotData data = stateMachine.exportSnapshot(index, index, term);
+        snapshotInFlight = true;
+        try {
+            snapshotExecutor.execute(() -> persistAndAdvanceSnapshot(data, index, term));
+        } catch (RejectedExecutionException e) {
+            snapshotInFlight = false;
+        }
+    }
+
+    private void persistAndAdvanceSnapshot(SnapshotData data, long index, long term) {
+        try {
+            snapshotStore.write(data);
+            latestSnapshot = data;
+            raftNode.advanceSnapshot(index, term);
+            commandsSinceSnapshot = 0;
+            log.info("CP 快照完成: lastIncludedIndex={}, lastIncludedTerm={}, entries={}",
+                    index, term, data.getEntries().size());
+        } catch (RuntimeException e) {
+            // 计数保留（≥ 阈值）→ 下一次 apply 立即重试
+            log.warn("CP 快照写入失败，稍后重试: lastIncludedIndex={}", index, e);
+        } finally {
+            snapshotInFlight = false;
+        }
+    }
+
+    // ==================== RaftSnapshotAccess（状态线程调用） ====================
+
+    @Override
+    public SnapshotData currentSnapshot() {
+        return latestSnapshot;
+    }
+
+    @Override
+    public void installSnapshot(SnapshotData data) {
+        // 顺序：先原子持久化文件，成功后再恢复状态机——任一时刻崩溃都可由
+        // "快照文件 + 日志" 确定性恢复；失败抛异常由 RaftNode 回拒绝应答
+        snapshotStore.write(data);
+        stateMachine.restore(data.toEntries(), data.toHistories());
+        earlyWatermark.clear();
+        logAppliedRevision = data.getLastIncludedIndex();
+        latestSnapshot = data;
+        commandsSinceSnapshot = 0;
+        log.info("快照已持久化并恢复状态机: lastIncludedIndex={}, entries={}",
+                data.getLastIncludedIndex(), data.getEntries().size());
     }
 
     /**

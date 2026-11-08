@@ -1,6 +1,6 @@
 # poly-config CP（Raft）设计
 
-> 状态：CP-1~CP-4 已完成（日志底座、选举、复制与提交、读与快照），进行中 CP-5（收尾）
+> 状态：CP-1~CP-5 全部完成（日志底座、选举、复制与提交、读与快照、SDK/状态页/矩阵收尾），本文档定稿
 > 更新：2026-11-08
 > 前置阅读：product-form.md（CP 路线 = 手写 Raft）、ap-design.md（工程模式参照）
 
@@ -294,7 +294,7 @@ ConfigProtocol
 | CP-2（✅ 2026-11-07） | `RaftNode` 单线程信箱 + 三角色；RequestVote 两道闸；随机超时/心跳压制；`--mode=cp` 装配放行（先单节点） | 单节点 cp 启动写通；3 节点选出唯一 leader；杀 leader 毫秒级重选；双投/双主单测打不穿 |
 | CP-3（✅ 2026-11-08） | AppendEntries 三闸 + nextIndex 回退；commit 本 term 限定 + no-op；commit→apply 循环（推送钩子）；D5 水位；RAFT_FORWARD 写转发 + expectedVersion；组刷盘升级 | 写任意节点→全集群提交可读、三节点客户端收推送；409 照常；2/3 宕机写不可用但一条不丢、恢复自愈；图 8 用例固化成测试 |
 | CP-4（✅ 2026-11-08） | read-index（LINEARIZABLE）；快照带 lastIncluded；InstallSnapshot 追平落后 follower | 线性一致读测试（选举窗口不回退）；快照压缩后杀 follower→重启一发追平；滚动重启收敛 |
-| CP-5 | SDK `getConfig` 加 ReadConsistency 重载（D8）；错误语义（选举中/无主提示）；RAFT_STATUS + 控制台 CP 视图（leader/term/commitIndex/peer matchIndex）；三节点测试矩阵；文档定稿 | 完整演示：杀 leader 换代、写读按语义正确；矩阵全绿；本文档补实施记录 |
+| CP-5（✅ 2026-11-08） | SDK `getConfig` 加 ReadConsistency 重载（D8）；错误语义（选举中/无主提示）；RAFT_STATUS + 控制台 CP 视图（leader/term/commitIndex/peer matchIndex）；三节点测试矩阵；文档定稿 | 完整演示：杀 leader 换代、写读按语义正确；矩阵全绿；本文档补实施记录 |
 
 顺序用意：CP-1/CP-2 先把"账本和朝代"做对（纯本地、无网络语义，地基）；CP-3 是
 主干且是 D5 语义缝的落点；CP-4 在正确性之上加能力；CP-5 照 AP-5 套路收尾。
@@ -454,6 +454,53 @@ ConfigProtocol
     延续）；**滚动重启收敛**（逐个杀+起，每步恢复唯一 leader、数据不丢、
     续写 version 链正确）。
 
+### CP-5 实施记录（2026-11-08，已完成）
+
+- **SDK ReadConsistency 重载（D8）**：`ReadConsistency` 移入 poly-config-common
+  （同包名，服务端引用零改动），客户端 `ConfigService` 增
+  `getConfig(ns, group, dataId, timeout, consistency)` 重载（含默认命名空间
+  变体）。`FetchRequest` 增 `consistency` 字段（null = LOCAL，兼容旧客户端），
+  `FetchProcessor` 解析后走 `ConfigService.get(..., consistency)` 新重载。
+  **LINEARIZABLE 路径绕过本地缓存与快照兜底**——本地数据可能陈旧，兜底即
+  违背语义；LOCAL 路径维持"缓存 → 拉取 → 快照兜底"不变。HTTP 可选
+  `?consistency=linearizable`（缺省/`local` = LOCAL，其余取值 400）。
+- **错误语义（选举中/无主提示）**：启用既有 `NOT_LEADER(50301)`——
+  RaftNode 的 propose/readIndex 角色闸改抛 NOT_LEADER（消息带
+  `leader=` 线索或"（选举中）"），无主/转发失败仍为 UNAVAILABLE
+  （消息"集群选举中，暂无 leader"/"leader 不可用: leader=..."），两者 HTTP
+  均 503。`FetchProcessor` 把 UNAVAILABLE/NOT_LEADER 映射为可重试的
+  500 类应答；客户端 `invokeWithFailover` 遇 500 类**换下一个节点重试**，
+  全部失败时把末次服务端提示带进 `所有服务端请求失败: ...` 错误链。
+- **RAFT_STATUS（4006）与控制台 CP 视图**：`NodeDetail` 增 CP 字段
+  （leaderId/term/commitIndex/lastApplied/snapshotIndex，PeerView 增
+  matchIndex；AP 详情保持默认值）。`RaftProtocol.localDetail()` 自报
+  角色/任期/提交与 apply 位点/快照位点 + leader 视角的 peer matchIndex
+  （`RaftNode` 增 matchIndex 对外视图与 `peerLastSeen`/`peerMatchIndex`
+  访问器）；`clusterStatus()` 按 AP 同款套路 `collectDetails`——本节点本地
+  构建、对端走 RAFT_STATUS（500ms 超时）、失败降级静态详情，并用详情
+  **回填 nodes 视图的对端真实 role/term/leaderId**（CP-2 的静态占位到此
+  替换）。`RaftStatusProcessor` 注册于 mode=cp。控制台集群页按
+  `detail.mode === 'CP'` 分支：复制行（commit/applied/snap 位点）、
+  复制位点行（peer matchIndex），AP 的分区/校验/异常行保持原样。
+- **三节点测试矩阵**：新增 `CpClusterMatrixTest`（端口段 18876-78/19876-78，
+  与 AP 矩阵及 CP 集成测试隔离），5 用例：
+  1. 全链路写任意节点收敛 + 三节点客户端全收到推送；
+  2. 状态采集聚合：任一节点视角 details 恰3 份、唯一 LEADER、任期/提交
+     位点非零、leader 的 peer matchIndex 覆盖已写位点，nodes 视图恰好
+     一个真实 leader；
+  3. **杀 leader 换代演示**：换代窗口并发写 503 带 leader 提示 → 新 leader
+     term 更高、写恢复、线性读读到新值不回退、存活节点收敛；
+  4. 跨节点并发乐观锁：三节点同时 expectedVersion 对准首写（CP 首写
+     version=2），恰好 1×200 + 2×409，全员收敛到胜者内容；
+  5. SDK ReadConsistency：LOCAL/LINEARIZABLE 都读到值；杀多数派后
+     LINEARIZABLE **失败（UNAVAILABLE）而非返回本地缓存旧值**，LOCAL
+     缓存照常可读（语义对照）；恢复多数派后线性读恢复。
+- **测试基建教训**：CP 的 version = raft index（no-op 占 1 号），矩阵里
+  expectedVersion 一律对准首写 version=2（AP 首写 version=1，直接照抄
+  会全量 409）；CP 写必须先等选出 leader 再发（选举窗口内首发写 503）。
+- **文档定稿**：状态行改为 CP-1~CP-5 全部完成；里程碑表 CP-5 标记 ✅；
+  本文补 CP-5 实施记录。
+
 ### 测试策略
 
 - 单测打状态机与闸门：投票决策矩阵、闸1/闸2 拒绝与回退、commit 本 term 限定、
@@ -491,3 +538,6 @@ ConfigProtocol
 | 2026-11-08 | read-index 确认只计**注册之后**到达的本朝应答（复制成败均可，带本朝 term 即认可领导权）；超时兜底、退位即作废，确认失败读 UNAVAILABLE 不回退 |
 | 2026-11-08 | InstallSnapshot 安装顺序 = 先持久化快照文件 + 恢复状态机、成功才丢本地日志；已有覆盖回带 match 不重复安装；commit/lastApplied 对齐快照位点 |
 | 2026-11-08 | 快照压缩内存裁剪按覆盖位点（firstIndex = covered+1，与段对齐无关）；物理段删除照旧，重启残留由快照位点裁决 |
+| 2026-11-08 | SDK LINEARIZABLE 绕过本地缓存与快照兜底（兜底即违背强一致）；LOCAL 维持缓存+兜底；500 类暂态错误客户端换节点重试 |
+| 2026-11-08 | 错误语义两分：无主/选举中 → UNAVAILABLE（消息带选举提示），非 leader 但有主 → NOT_LEADER（消息带 leader 线索），HTTP 均 503 |
+| 2026-11-08 | 状态采集复用 NodeDetail 加 CP 字段（AP 留默认值），控制台按 mode 分支渲染；nodes 视图用自报详情回填对端真实 role/term |

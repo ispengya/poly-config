@@ -105,6 +105,12 @@ public final class RaftNode implements Closeable {
     private volatile long lastAppliedView;
 
     /**
+     * 各 follower matchIndex 对外视图（状态线程写、状态采集线程读，
+     * CP-5 RAFT_STATUS 上报 leader 的复制位点）。
+     */
+    private volatile Map<String, Long> matchIndexView = Collections.emptyMap();
+
+    /**
      * 是否已关闭。
      */
     private volatile boolean closed;
@@ -306,6 +312,7 @@ public final class RaftNode implements Closeable {
         // （对象尚未发布，构造线程执行安全；此后一切变更都走状态线程）
         if (this.commitIndex > this.lastApplied) {
             this.matchIndex.put(nodeId, raftLog.lastIndex());
+            publishMatchIndex();
             applyCommitted();
         }
         this.stateExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -406,6 +413,36 @@ public final class RaftNode implements Closeable {
                 && System.currentTimeMillis() - lastSeen <= 15_000L;
     }
 
+    /**
+     * peer 最近一次成功交互时间（epoch millis，0 = 从未），供状态采集上报。
+     *
+     * @param peerNodeId peer 节点 ID
+     * @return 最近交互时间
+     */
+    public long peerLastSeen(String peerNodeId) {
+        Long lastSeen = peerLastSeen.get(peerNodeId);
+        return lastSeen == null ? 0L : lastSeen;
+    }
+
+    /**
+     * leader 视角该 follower 已确认复制到的 index（状态采集上报；
+     * 非 leader 或尚无确认为 0）。
+     *
+     * @param peerNodeId peer 节点 ID
+     * @return matchIndex
+     */
+    public long peerMatchIndex(String peerNodeId) {
+        Long match = matchIndexView.get(peerNodeId);
+        return match == null ? 0L : match;
+    }
+
+    /**
+     * 发布 matchIndex 视图（状态线程；位点变更后调用）。
+     */
+    private void publishMatchIndex() {
+        matchIndexView = Collections.unmodifiableMap(new HashMap<>(matchIndex));
+    }
+
     // ==================== 入站消息（任意线程投递 → 状态线程执行） ====================
 
     /**
@@ -468,7 +505,7 @@ public final class RaftNode implements Closeable {
                 }
                 if (role != RaftRole.LEADER) {
                     String leader = leaderId.isEmpty() ? "（选举中）" : ", leader=" + leaderId;
-                    throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    throw new PolyConfigException(ErrorCode.NOT_LEADER,
                             "当前节点不是 leader" + leader);
                 }
                 long next = raftLog.lastIndex() + 1;
@@ -513,6 +550,7 @@ public final class RaftNode implements Closeable {
                     if (role == RaftRole.LEADER) {
                         // 刷盘完成，自身副本可计入多数派
                         matchIndex.put(nodeId, raftLog.lastIndex());
+                        publishMatchIndex();
                     }
                     tryCommit();
                 } catch (Throwable t) {
@@ -549,7 +587,7 @@ public final class RaftNode implements Closeable {
                 }
                 if (role != RaftRole.LEADER) {
                     String leader = leaderId.isEmpty() ? "（选举中）" : ", leader=" + leaderId;
-                    throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    throw new PolyConfigException(ErrorCode.NOT_LEADER,
                             "当前节点不是 leader" + leader);
                 }
                 PendingRead read = new PendingRead(commitIndex, future);
@@ -886,6 +924,7 @@ public final class RaftNode implements Closeable {
             long known = matchIndex.getOrDefault(peerId, 0L);
             if (match > known) {
                 matchIndex.put(peerId, match);
+                publishMatchIndex();
             }
             long next = Math.max(nextIndex.getOrDefault(peerId, 1L), match + 1);
             // 防御：match 不得把 nextIndex 推过本地日志尾之后
@@ -1055,6 +1094,7 @@ public final class RaftNode implements Closeable {
         long known = matchIndex.getOrDefault(peerId, 0L);
         if (match > known) {
             matchIndex.put(peerId, match);
+            publishMatchIndex();
         }
         long next = Math.max(nextIndex.getOrDefault(peerId, 1L), match + 1);
         next = Math.min(next, raftLog.lastIndex() + 1);
@@ -1155,6 +1195,7 @@ public final class RaftNode implements Closeable {
             matchIndex.put(member.getNodeId(),
                     member.getNodeId().equals(nodeId) ? noOpIndex : 0L);
         }
+        publishMatchIndex();
         updateViews();
         log.info("当选 leader: term={}, noOpIndex={}, members={}",
                 metaStore.currentTerm(), noOpIndex, members.size());

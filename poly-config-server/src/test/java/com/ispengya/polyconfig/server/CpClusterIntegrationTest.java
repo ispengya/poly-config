@@ -456,8 +456,11 @@ public class CpClusterIntegrationTest {
                             servers.get((leader.index + 1) % servers.size()), key);
                     break;
                 } catch (PolyConfigException e) {
-                    assertEquals("选举窗口内只允许 UNAVAILABLE: " + e.getMessage(),
-                            ErrorCode.UNAVAILABLE, e.getErrorCode());
+                    // 选举窗口内只允许"不可用/非 leader"两类暂态失败，绝不返回旧值
+                    assertTrue("选举窗口内只允许 UNAVAILABLE/NOT_LEADER: "
+                                    + e.getErrorCode() + ", " + e.getMessage(),
+                            e.getErrorCode() == ErrorCode.UNAVAILABLE
+                                    || e.getErrorCode() == ErrorCode.NOT_LEADER);
                     Thread.sleep(50L);
                 }
             }

@@ -290,7 +290,7 @@ public class RaftNodeTest {
                 fail("非 leader propose 应被拒绝");
             } catch (ExecutionException e) {
                 assertTrue(e.getCause() instanceof PolyConfigException);
-                assertEquals(ErrorCode.UNAVAILABLE,
+                assertEquals(ErrorCode.NOT_LEADER,
                         ((PolyConfigException) e.getCause()).getErrorCode());
                 assertTrue(e.getCause().getMessage().contains("leader"));
             }
@@ -512,13 +512,13 @@ public class RaftNodeTest {
             assertTrue("readIndex 应覆盖已提交位点: " + readIndex, readIndex >= 1);
             assertTrue("完成时 lastApplied 应覆盖基线", leader.lastApplied() >= readIndex);
 
-            // follower：角色闸拒绝（UNAVAILABLE，不返回任何值）
+            // follower：角色闸拒绝（NOT_LEADER，不返回任何值）
             try {
                 follower.readIndex().get(3, TimeUnit.SECONDS);
                 fail("follower 的 read-index 应被拒绝");
             } catch (ExecutionException e) {
                 assertTrue(e.getCause() instanceof PolyConfigException);
-                assertEquals(ErrorCode.UNAVAILABLE,
+                assertEquals(ErrorCode.NOT_LEADER,
                         ((PolyConfigException) e.getCause()).getErrorCode());
             }
         } finally {

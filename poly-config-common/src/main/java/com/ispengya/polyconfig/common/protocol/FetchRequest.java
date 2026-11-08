@@ -20,6 +20,12 @@ public class FetchRequest {
      */
     private String dataId;
 
+    /**
+     * 读一致性级别（{@code LOCAL}/{@code LINEARIZABLE}，D8）；
+     * {@code null} 视为 {@code LOCAL}，兼容旧客户端。
+     */
+    private String consistency;
+
     public FetchRequest() {
     }
 
@@ -61,5 +67,13 @@ public class FetchRequest {
 
     public void setDataId(String dataId) {
         this.dataId = dataId;
+    }
+
+    public String getConsistency() {
+        return consistency;
+    }
+
+    public void setConsistency(String consistency) {
+        this.consistency = consistency;
     }
 }

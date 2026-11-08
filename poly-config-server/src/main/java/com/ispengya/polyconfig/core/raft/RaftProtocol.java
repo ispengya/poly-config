@@ -23,6 +23,7 @@ import com.ispengya.polyconfig.consistency.ChangeListener;
 import com.ispengya.polyconfig.consistency.ClusterMember;
 import com.ispengya.polyconfig.consistency.ClusterStatus;
 import com.ispengya.polyconfig.consistency.ConfigProtocol;
+import com.ispengya.polyconfig.consistency.NodeDetail;
 import com.ispengya.polyconfig.consistency.NodeRole;
 import com.ispengya.polyconfig.consistency.NodeStatus;
 import com.ispengya.polyconfig.consistency.ProtocolMode;
@@ -38,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -100,6 +102,11 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
     private static final long RPC_TIMEOUT_MIN_MILLIS = 200L;
 
     private static final long RPC_TIMEOUT_MAX_MILLIS = 3_000L;
+
+    /**
+     * 状态采集 RPC 超时（同 AP：采集是纯读，不阻塞控制台）。
+     */
+    private static final long STATUS_TIMEOUT_MILLIS = 500L;
 
     private final String nodeId;
 
@@ -640,13 +647,30 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
 
     @Override
     public ClusterStatus clusterStatus() {
+        // CP-5：内部通道第四种用途（同 AP）——RAFT_STATUS 向全体成员采集
+        // 自报详情（role/term/commitIndex/lastApplied/peer matchIndex），
+        // nodes 视图用详情回填对端真实角色与任期；失败降级为静态信息
+        List<NodeDetail> details = collectDetails();
+        Map<String, NodeDetail> byId = new HashMap<>();
+        for (NodeDetail detail : details) {
+            byId.put(detail.getNodeId(), detail);
+        }
         List<NodeStatus> nodes = new ArrayList<>(members.size());
         for (ClusterMember member : members) {
             if (member.getNodeId().equals(nodeId)) {
                 nodes.add(status());
+                continue;
+            }
+            NodeDetail detail = byId.get(member.getNodeId());
+            if (detail != null) {
+                nodes.add(new NodeStatus(member.getNodeId(), member.getHost(),
+                        member.getHttpPort(), member.getRemotingPort(),
+                        ProtocolMode.CP,
+                        detail.getRole() == null ? NodeRole.FOLLOWER : detail.getRole(),
+                        detail.isHealthy(), detail.getTerm(), detail.getLeaderId(),
+                        members.size()));
             } else {
-                // CP-2：对端 role/term 无采集通道（CP-5 RAFT_STATUS 自报），
-                // 健康位来自本节点与对端的真实投票/心跳交互
+                // 采集失败降级：健康位来自本节点与对端的真实心跳交互
                 nodes.add(new NodeStatus(member.getNodeId(), member.getHost(),
                         member.getHttpPort(), member.getRemotingPort(),
                         ProtocolMode.CP, NodeRole.FOLLOWER,
@@ -654,7 +678,109 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
                         0L, "", members.size()));
             }
         }
-        return new ClusterStatus(clusterId, nodeId, ProtocolMode.CP, nodes);
+        ClusterStatus result = new ClusterStatus(clusterId, nodeId, ProtocolMode.CP, nodes);
+        result.setDetails(details);
+        return result;
+    }
+
+    /**
+     * 向全体成员采集详细状态（按成员顺序）；本节点本地构建，对端走
+     * {@code RAFT_STATUS}，失败降级为静态详情。
+     *
+     * @return 详细状态列表
+     */
+    private List<NodeDetail> collectDetails() {
+        List<NodeDetail> details = new ArrayList<>(members.size());
+        for (ClusterMember member : members) {
+            if (member.getNodeId().equals(nodeId)) {
+                try {
+                    details.add(localDetail());
+                } catch (RuntimeException e) {
+                    log.debug("本地详细状态构建失败", e);
+                    details.add(staticDetail(member));
+                }
+                continue;
+            }
+            try {
+                RemotingCommand request = RemotingCommand.createRequestCommand(
+                        ProtocolCodes.RAFT_STATUS, null);
+                RemotingCommand response = remotingClient.invokeSync(
+                        address(member), request, STATUS_TIMEOUT_MILLIS);
+                if (response.getCode() == ProtocolCodes.RESPONSE_OK
+                        && response.getBody() != null && response.getBody().length > 0) {
+                    NodeDetail detail = JsonUtils.parseObject(
+                            new String(response.getBody(), StandardCharsets.UTF_8),
+                            NodeDetail.class);
+                    if (detail != null && detail.getNodeId() != null) {
+                        details.add(detail);
+                        continue;
+                    }
+                }
+                details.add(staticDetail(member));
+            } catch (Exception e) {
+                log.debug("状态采集失败, peer={}: {}", member.getNodeId(), e.toString());
+                details.add(staticDetail(member));
+            }
+        }
+        return details;
+    }
+
+    /**
+     * 本节点的详细状态（RAFT_STATUS 自报：角色/任期/提交与 apply 位点、
+     * 快照位点、leader 视角的 peer matchIndex）。
+     *
+     * @return 详细状态
+     */
+    public NodeDetail localDetail() {
+        NodeDetail detail = new NodeDetail();
+        detail.setNodeId(nodeId);
+        detail.setHost(host);
+        detail.setPort(httpPort);
+        detail.setRemotingPort(remotingPort);
+        detail.setMode(ProtocolMode.CP);
+        detail.setRole(toNodeRole(raftNode.role()));
+        detail.setHealthy(!closed);
+        detail.setMemberCount(members.size());
+        detail.setCurrentRevision(raftNode.commitIndex());
+        detail.setLeaderId(raftNode.leaderId());
+        detail.setTerm(raftNode.term());
+        detail.setCommitIndex(raftNode.commitIndex());
+        detail.setLastApplied(raftNode.lastApplied());
+        detail.setSnapshotIndex(raftNode.snapshotIndex());
+        List<NodeDetail.PeerView> views = new ArrayList<>();
+        for (ClusterMember member : members) {
+            if (member.getNodeId().equals(nodeId)) {
+                continue;
+            }
+            NodeDetail.PeerView view = new NodeDetail.PeerView();
+            view.setNodeId(member.getNodeId());
+            view.setLastSeen(raftNode.peerLastSeen(member.getNodeId()));
+            // matchIndex 是 leader 视角的复制位点：本节点为 leader 时上报，
+            // follower 视为未知（0）
+            view.setMatchIndex(raftNode.peerMatchIndex(member.getNodeId()));
+            views.add(view);
+        }
+        detail.setPeers(views);
+        return detail;
+    }
+
+    /**
+     * 采集失败时的静态降级详情（只有身份信息与健康位）。
+     *
+     * @param member 成员
+     * @return 静态详情
+     */
+    private NodeDetail staticDetail(ClusterMember member) {
+        NodeDetail detail = new NodeDetail();
+        detail.setNodeId(member.getNodeId());
+        detail.setHost(member.getHost());
+        detail.setPort(member.getHttpPort());
+        detail.setRemotingPort(member.getRemotingPort());
+        detail.setMode(ProtocolMode.CP);
+        detail.setRole(NodeRole.FOLLOWER);
+        detail.setHealthy(raftNode.isPeerHealthy(member.getNodeId()));
+        detail.setMemberCount(members.size());
+        return detail;
     }
 
     @Override

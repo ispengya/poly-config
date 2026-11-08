@@ -58,6 +58,33 @@ public class NodeDetail {
      */
     private long currentRevision;
 
+    // ===== CP（RAFT_STATUS 自报）字段：AP 详情保持默认值 =====
+
+    /**
+     * CP：本节点已知的 leader（"" 表示选举中/未知）。
+     */
+    private String leaderId = "";
+
+    /**
+     * CP：本节点当前任期。
+     */
+    private long term;
+
+    /**
+     * CP：本节点 commitIndex。
+     */
+    private long commitIndex;
+
+    /**
+     * CP：本节点 lastApplied。
+     */
+    private long lastApplied;
+
+    /**
+     * CP：本节点快照位点（lastIncludedIndex，0 = 无快照）。
+     */
+    private long snapshotIndex;
+
     /**
      * 本节点拥有的分区列表（{@code namespace/group}，有序去重）。
      */
@@ -155,6 +182,46 @@ public class NodeDetail {
         this.currentRevision = currentRevision;
     }
 
+    public String getLeaderId() {
+        return leaderId;
+    }
+
+    public void setLeaderId(String leaderId) {
+        this.leaderId = leaderId == null ? "" : leaderId;
+    }
+
+    public long getTerm() {
+        return term;
+    }
+
+    public void setTerm(long term) {
+        this.term = term;
+    }
+
+    public long getCommitIndex() {
+        return commitIndex;
+    }
+
+    public void setCommitIndex(long commitIndex) {
+        this.commitIndex = commitIndex;
+    }
+
+    public long getLastApplied() {
+        return lastApplied;
+    }
+
+    public void setLastApplied(long lastApplied) {
+        this.lastApplied = lastApplied;
+    }
+
+    public long getSnapshotIndex() {
+        return snapshotIndex;
+    }
+
+    public void setSnapshotIndex(long snapshotIndex) {
+        this.snapshotIndex = snapshotIndex;
+    }
+
     public List<String> getOwnedPartitions() {
         return ownedPartitions;
     }
@@ -220,12 +287,25 @@ public class NodeDetail {
          */
         private long lastDeltaCount;
 
+        /**
+         * CP：leader 视角该 follower 已确认复制到的 index（0 = 未知/非 leader）。
+         */
+        private long matchIndex;
+
         public String getNodeId() {
             return nodeId;
         }
 
         public void setNodeId(String nodeId) {
             this.nodeId = nodeId;
+        }
+
+        public long getMatchIndex() {
+            return matchIndex;
+        }
+
+        public void setMatchIndex(long matchIndex) {
+            this.matchIndex = matchIndex;
         }
 
         public long getLastSeen() {

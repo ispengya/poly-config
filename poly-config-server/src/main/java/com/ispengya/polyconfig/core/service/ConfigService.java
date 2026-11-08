@@ -84,7 +84,7 @@ public class ConfigService {
     }
 
     /**
-     * 读取配置。
+     * 读取配置（默认 LOCAL）。
      *
      * @param namespace 命名空间
      * @param group 分组
@@ -92,11 +92,28 @@ public class ConfigService {
      * @return 配置条目
      */
     public Optional<ConfigEntry> get(String namespace, String group, String dataId) {
+        return get(namespace, group, dataId, ReadConsistency.LOCAL);
+    }
+
+    /**
+     * 读取配置（指定读一致性，D8）。
+     *
+     * <p>默认 LOCAL（docs/ap-design.md §4）：全量副本下本地读即可，
+     * 控制台/SDK 的读后即写由写链路的"转发节点先 apply 再应答"保证；
+     * {@link ReadConsistency#LINEARIZABLE} 走协议强一致读
+     * （CP：leader + read-index；AP：owner 转发）。</p>
+     *
+     * @param namespace 命名空间
+     * @param group 分组
+     * @param dataId 配置项 ID
+     * @param consistency 读一致性级别；{@code null} 视为 LOCAL
+     * @return 配置条目
+     */
+    public Optional<ConfigEntry> get(String namespace, String group, String dataId,
+                                     ReadConsistency consistency) {
         ConfigKey key = new ConfigKey(namespace, group, dataId);
-        // 默认 LOCAL（docs/ap-design.md §4）：全量副本下本地读即可，
-        // 控制台/SDK 的读后即写由写链路的"转发节点先 apply 再应答"保证；
-        // 需要强一致的调用方直接使用 protocol.read(key, LINEARIZABLE)
-        return protocol.read(key, ReadConsistency.LOCAL);
+        return protocol.read(key,
+                consistency == null ? ReadConsistency.LOCAL : consistency);
     }
 
     /**

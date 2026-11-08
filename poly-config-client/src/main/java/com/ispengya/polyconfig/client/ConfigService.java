@@ -1,12 +1,14 @@
 package com.ispengya.polyconfig.client;
 
+import com.ispengya.polyconfig.consistency.ReadConsistency;
+
 /**
  * 客户端配置服务。
  */
 public interface ConfigService extends AutoCloseable {
 
     /**
-     * 读取配置。
+     * 读取配置（默认 {@link ReadConsistency#LOCAL}）。
      *
      * @param namespace 命名空间，null 时使用客户端默认值
      * @param group 分组
@@ -15,6 +17,23 @@ public interface ConfigService extends AutoCloseable {
      * @return 配置内容；不存在时返回 null
      */
     String getConfig(String namespace, String group, String dataId, long timeoutMillis);
+
+    /**
+     * 读取配置（指定读一致性，D8）。
+     *
+     * <p>{@link ReadConsistency#LINEARIZABLE} 绕过本地缓存与快照兜底直连
+     * 服务端强一致读（CP：read-index；AP：owner 转发），失败抛
+     * {@code UNAVAILABLE}——绝不回退返回旧值。</p>
+     *
+     * @param namespace 命名空间，null 时使用客户端默认值
+     * @param group 分组
+     * @param dataId 配置项 ID
+     * @param timeoutMillis 请求超时时间
+     * @param consistency 读一致性级别；{@code null} 视为 LOCAL
+     * @return 配置内容；不存在时返回 null
+     */
+    String getConfig(String namespace, String group, String dataId, long timeoutMillis,
+                     ReadConsistency consistency);
 
     /**
      * 使用默认命名空间读取配置。
@@ -26,6 +45,20 @@ public interface ConfigService extends AutoCloseable {
      */
     default String getConfig(String group, String dataId, long timeoutMillis) {
         return getConfig(null, group, dataId, timeoutMillis);
+    }
+
+    /**
+     * 使用默认命名空间按指定一致性读取配置。
+     *
+     * @param group 分组
+     * @param dataId 配置项 ID
+     * @param timeoutMillis 请求超时时间
+     * @param consistency 读一致性级别
+     * @return 配置内容；不存在时返回 null
+     */
+    default String getConfig(String group, String dataId, long timeoutMillis,
+                             ReadConsistency consistency) {
+        return getConfig(null, group, dataId, timeoutMillis, consistency);
     }
 
     /**

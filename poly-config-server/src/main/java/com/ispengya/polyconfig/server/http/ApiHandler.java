@@ -13,6 +13,7 @@ import com.ispengya.polyconfig.common.protocol.PageView;
 import com.ispengya.polyconfig.common.protocol.PublishRequest;
 import com.ispengya.polyconfig.common.protocol.RollbackRequest;
 import com.ispengya.polyconfig.common.util.JsonUtils;
+import com.ispengya.polyconfig.consistency.ReadConsistency;
 import com.ispengya.polyconfig.core.service.ConfigService;
 import com.ispengya.polyconfig.server.push.SubscriptionRegistry;
 import com.ispengya.polyconfig.server.push.SubscriptionSnapshot;
@@ -216,13 +217,36 @@ public class ApiHandler implements HttpHandler {
     private void handleGetConfig(HttpExchange exchange) throws IOException {
         Map<String, String> query = query(exchange);
         Optional<ConfigEntry> entry = configService.get(query.get("namespace"),
-                query.get("group"), query.get("dataId"));
+                query.get("group"), query.get("dataId"),
+                parseConsistency(query.get("consistency")));
         if (!entry.isPresent()) {
             writeJson(exchange, 404,
                     ApiResponse.error(ErrorCode.NOT_FOUND.getCode(), "配置不存在"));
             return;
         }
         writeJson(exchange, 200, ApiResponse.ok(ConfigView.from(entry.get())));
+    }
+
+    /**
+     * 解析 {@code ?consistency=} 查询参数（D8）：缺省/空 = LOCAL，
+     * {@code linearizable}（大小写不敏感）= LINEARIZABLE，其余取值 400。
+     *
+     * @param value 查询参数原始值
+     * @return 读一致性级别
+     */
+    private static ReadConsistency parseConsistency(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return ReadConsistency.LOCAL;
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if ("local".equals(normalized)) {
+            return ReadConsistency.LOCAL;
+        }
+        if ("linearizable".equals(normalized)) {
+            return ReadConsistency.LINEARIZABLE;
+        }
+        throw new PolyConfigException(ErrorCode.INVALID_ARGUMENT,
+                "不支持的 consistency 取值: " + value + "（可选 local/linearizable）");
     }
 
     private void handleListConfigs(HttpExchange exchange) throws IOException {

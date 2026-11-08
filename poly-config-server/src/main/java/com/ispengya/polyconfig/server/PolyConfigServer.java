@@ -23,6 +23,7 @@ import com.ispengya.polyconfig.server.remoting.RaftAppendProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftForwardProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftReadProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftSnapshotProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftStatusProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftVoteProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -182,6 +183,9 @@ public class PolyConfigServer {
             // 线性读（CP-4）：任意节点 → leader，read-index 在 leader 侧完成
             this.remotingServer.registerProcessor(ProtocolCodes.RAFT_READ,
                     new RaftReadProcessor(raftProtocol), remotingExecutor);
+            // 状态采集（CP-5）：成员自报 role/term/commitIndex/peer matchIndex
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_STATUS,
+                    new RaftStatusProcessor(raftProtocol::localDetail), remotingExecutor);
         }
 
         this.changePusher = new ChangePusher(remotingServer, registry);

@@ -13,6 +13,7 @@ import com.ispengya.polyconfig.common.protocol.SubscribeItem;
 import com.ispengya.polyconfig.common.protocol.SubscribeRequest;
 import com.ispengya.polyconfig.common.util.JsonUtils;
 import com.ispengya.polyconfig.common.util.Md5Utils;
+import com.ispengya.polyconfig.consistency.ReadConsistency;
 import com.ispengya.remoting.netty.NettyRemotingClient;
 import com.ispengya.remoting.protocol.RemotingCommand;
 import org.slf4j.Logger;
@@ -168,14 +169,31 @@ public class PolyConfigClient implements ConfigService {
 
     @Override
     public String getConfig(String namespace, String group, String dataId, long timeoutMillis) {
+        return getConfig(namespace, group, dataId, timeoutMillis, ReadConsistency.LOCAL);
+    }
+
+    @Override
+    public String getConfig(String namespace, String group, String dataId, long timeoutMillis,
+                            ReadConsistency consistency) {
         ensureOpen();
+        ReadConsistency level = consistency == null ? ReadConsistency.LOCAL : consistency;
         ConfigKey key = key(namespace, group, dataId);
+        if (level == ReadConsistency.LINEARIZABLE) {
+            // D8：强一致读绕过本地缓存与快照兜底——本地数据可能陈旧，
+            // 兜底即违背语义；失败按错误语义抛出（选举中/无主 → UNAVAILABLE）
+            ConfigView view = fetch(key, timeout(timeoutMillis), level);
+            if (view == null) {
+                return null;
+            }
+            applyView(view, false);
+            return view.getContent();
+        }
         String cached = contentCache.get(key);
         if (cached != null) {
             return cached;
         }
         try {
-            ConfigView view = fetch(key, timeout(timeoutMillis));
+            ConfigView view = fetch(key, timeout(timeoutMillis), level);
             if (view == null) {
                 return null;
             }
@@ -316,9 +334,12 @@ public class PolyConfigClient implements ConfigService {
         }
     }
 
-    private ConfigView fetch(ConfigKey key, long timeoutMillis) {
+    private ConfigView fetch(ConfigKey key, long timeoutMillis, ReadConsistency consistency) {
         FetchRequest request = FetchRequest.of(key.getNamespace(), key.getGroup(),
                 key.getDataId());
+        if (consistency != null && consistency != ReadConsistency.LOCAL) {
+            request.setConsistency(consistency.name());
+        }
         RemotingCommand response = invokeWithFailover(ProtocolCodes.FETCH,
                 JsonUtils.toJson(request).getBytes(StandardCharsets.UTF_8), timeoutMillis);
         if (response.getCode() == ProtocolCodes.RESPONSE_NOT_FOUND) {
@@ -347,6 +368,15 @@ public class PolyConfigClient implements ConfigService {
             try {
                 RemotingCommand response = remotingClient.invokeSync(
                         address, request, timeoutMillis);
+                if (response.getCode() == ProtocolCodes.RESPONSE_SERVER_ERROR) {
+                    // 暂态错误（CP 选举中/非 leader 提示等）：换下一个节点重试，
+                    // 全部失败时把服务端提示带出错误语义
+                    lastError = new PolyConfigException(ErrorCode.UNAVAILABLE,
+                            address + ": " + response.getRemark());
+                    log.warn("服务端暂态错误，换节点重试, address={}, code={}, remark={}",
+                            address, code, response.getRemark());
+                    continue;
+                }
                 currentServerIndex.set(index);
                 return response;
             } catch (Exception e) {
@@ -356,7 +386,9 @@ public class PolyConfigClient implements ConfigService {
                 log.debug("请求服务端失败详情", e);
             }
         }
-        throw new PolyConfigException(ErrorCode.UNAVAILABLE, "所有服务端请求失败", lastError);
+        String hint = lastError == null ? "" : (": " + lastError.getMessage());
+        throw new PolyConfigException(ErrorCode.UNAVAILABLE,
+                "所有服务端请求失败" + hint, lastError);
     }
 
     private void handlePush(RemotingCommand message) {
@@ -398,7 +430,8 @@ public class PolyConfigClient implements ConfigService {
                 applyDeletion(key, event.getVersion());
                 return;
             }
-            ConfigView view = fetch(key, options.getRequestTimeoutMillis());
+            ConfigView view = fetch(key, options.getRequestTimeoutMillis(),
+                    ReadConsistency.LOCAL);
             if (view == null) {
                 applyDeletion(key, event.getVersion());
                 return;

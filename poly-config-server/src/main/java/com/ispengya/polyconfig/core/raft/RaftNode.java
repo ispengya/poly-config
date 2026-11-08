@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -45,9 +46,20 @@ import java.util.function.Consumer;
  * "多数派 matchIndex 覆盖且 term == currentTerm" 的位置；旧 term 条目由
  * 当选后追加的 no-op 连带提交。单成员集群多数派为 1，本地追加即提交。</p>
  *
- * <p>CP-2 范围：选举 + 心跳 + 单成员写入。多节点写复制（AppendEntries 带
- * 条目、nextIndex 回退、leaderCommit 传播）由 CP-3 提供，此间多节点
- * propose 明确拒绝。</p>
+ * <p>CP-3 起提供多节点写复制：propose 追加后立即向全体 follower 推送
+ * AppendEntries（逐 peer 的 nextIndex 流水线），follower 走闸1/闸2/闸3
+ * （term → prev 接缝 → 冲突截断追加 + fsync），应答驱动 matchIndex 推进、
+ * nextIndex 回退（带日志尾线索跳跃）与多数派提交；leaderCommit 随心跳
+ * 传播，follower 侧 commit→apply 循环与 leader 同一套。</p>
+ *
+ * <p>组刷盘：propose 的本地追加不立即 fsync，而是入队尾部"刷盘+提交"任务
+ * ——与队列中后续追加合并为一轮 fsync（多写共享一次磁盘动作）；follower
+ * 侧一轮 AppendEntries 的全部条目也只 fsync 一次。leader 计入多数派的
+ * 自身 matchIndex 只在 fsync 完成后推进（先持久化、再计票）。</p>
+ *
+ * <p><b>规模说明（刻意例外）</b>：本类超出 800 行软上限属有意为之——选举、
+ * 复制、提交、组刷盘全部读写同一批"仅状态线程可见"的字段，按职责拆类会
+ * 迫使这些字段公开或加锁，破坏 §1 的单线程信箱铁律；拆分收益低于内聚损失。</p>
  */
 public final class RaftNode implements Closeable {
 
@@ -125,6 +137,16 @@ public final class RaftNode implements Closeable {
     private long commitIndex;
 
     private long lastApplied;
+
+    /**
+     * 日志有未 fsync 的追加（组刷盘合并用）。
+     */
+    private boolean logDirty;
+
+    /**
+     * 已有排队中的"刷盘+提交"任务（避免重复入队，多个追加共享一轮）。
+     */
+    private boolean flushScheduled;
 
     /**
      * 各成员已确认复制到的 index（leader 视角；本节点为本地追加位点）。
@@ -319,7 +341,11 @@ public final class RaftNode implements Closeable {
     }
 
     /**
-     * 提交一条写命令（仅 leader；CP-2 范围内仅单成员集群可提交）。
+     * 提交一条写命令（仅 leader；多成员经 AppendEntries 多数派提交）。
+     *
+     * <p>状态线程内按序执行：prepare（D5 校验 + 赋版本）→ 追加 → 立即
+     * 向 follower 推送 → 入队组刷盘任务（fsync 后才把自身计入 matchIndex
+     * 并推进 commit）。future 在条目 commit + apply 后完成（D7）。</p>
      *
      * @param prepare 前置处理（校验 + 赋版本 + 编码），状态线程内按序执行
      * @return 条目 apply 后完成的 future（value = index）
@@ -340,23 +366,57 @@ public final class RaftNode implements Closeable {
                     throw new PolyConfigException(ErrorCode.UNAVAILABLE,
                             "当前节点不是 leader" + leader);
                 }
-                if (members.size() > 1) {
-                    // TODO(CP-3)：接入 AppendEntries 复制与多数派提交后移除
-                    throw new PolyConfigException(ErrorCode.UNAVAILABLE,
-                            "CP 多节点写复制由 CP-3 提供，当前里程碑仅支持单节点写入");
-                }
                 long next = raftLog.lastIndex() + 1;
                 byte[] payload = prepare.prepare(next);
                 long index = raftLog.append(metaStore.currentTerm(), payload);
-                raftLog.flush();
-                matchIndex.put(nodeId, index);
+                logDirty = true;
                 applyWaiters.put(index, future);
-                tryCommit();
+                // 复制不依赖本地 fsync（follower 持久化各自独立），先推送省一个心跳周期
+                replicateToPeers();
+                // 组刷盘：与队列中后续追加合并为一轮 fsync，再计票提交
+                scheduleFlushAndCommit();
             } catch (Throwable t) {
                 future.completeExceptionally(t);
             }
         });
         return future;
+    }
+
+    /**
+     * 组刷盘 + 提交（状态线程尾部任务）：一轮 fsync 覆盖此前全部待刷追加，
+     * 随后把自身计入 matchIndex 并推进多数派提交。
+     *
+     * <p>多个 propose 排队时只有首个入队本任务，后续追加被同一轮 fsync
+     * 覆盖（组提交）。刷盘前自身不计入多数派——先持久化、再计票。</p>
+     */
+    private void scheduleFlushAndCommit() {
+        if (flushScheduled || closed) {
+            return;
+        }
+        flushScheduled = true;
+        try {
+            stateExecutor.execute(() -> {
+                flushScheduled = false;
+                if (closed) {
+                    return;
+                }
+                try {
+                    if (logDirty) {
+                        raftLog.flush();
+                        logDirty = false;
+                    }
+                    if (role == RaftRole.LEADER) {
+                        // 刷盘完成，自身副本可计入多数派
+                        matchIndex.put(nodeId, raftLog.lastIndex());
+                    }
+                    tryCommit();
+                } catch (Throwable t) {
+                    log.error("组刷盘/提交任务失败", t);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            flushScheduled = false;
+        }
     }
 
     // ==================== 投票处理（状态线程） ====================
@@ -437,10 +497,11 @@ public final class RaftNode implements Closeable {
         }
         long currentTerm = metaStore.currentTerm();
         AppendEntriesResponse response = new AppendEntriesResponse();
+        // 日志尾线索（拒绝时供 leader 跳跃回退；成功时在追加后刷新）
         response.setLastLogIndex(raftLog.lastIndex());
         response.setLastLogTerm(raftLog.lastTerm());
 
-        // 闸1：term 比对
+        // 闸1：term 比对——过期 leader 直接拒绝并回带本朝 term（教化其退位）
         if (request.getTerm() < currentTerm) {
             response.setTerm(currentTerm);
             response.setSuccess(false);
@@ -449,39 +510,100 @@ public final class RaftNode implements Closeable {
         if (request.getTerm() > currentTerm) {
             metaStore.persist(request.getTerm(), null);
         }
-        // 合法 leader（本朝或新朝）：认领、重置选举计时器（心跳压制）
+        // 合法 leader（本朝或新朝）：认领、重置选举计时器（心跳压制）；
+        // 本节点若原是 leader 则在此退位并使在途写失败
         becomeFollower(request.getLeaderId());
         recordPeerSeen(request.getLeaderId());
 
+        List<LogEntryData> entries = request.getEntries();
+        int entryCount = entries == null ? 0 : entries.size();
+
         // 闸2：prevLog 接缝核对（prevLogIndex=0 表示从头开始，无接缝可校验）
         long prev = request.getPrevLogIndex();
-        if (prev == 0) {
-            response.setSuccess(true);
-            response.setMatchIndex(0);
-        } else if (prev < raftLog.firstIndex() || prev > raftLog.lastIndex()
-                || raftLog.termAt(prev) != request.getPrevLogTerm()) {
-            // 拒绝并回带日志尾线索（CP-3 的 nextIndex 回退依据）
+        boolean aligned = prev == 0
+                || (prev >= raftLog.firstIndex() && prev <= raftLog.lastIndex()
+                && raftLog.termAt(prev) == request.getPrevLogTerm());
+        if (!aligned) {
+            // 拒绝并回带日志尾线索（leader 据此跳跃回退 nextIndex）
+            response.setTerm(metaStore.currentTerm());
             response.setSuccess(false);
             response.setMatchIndex(-1);
-        } else {
-            response.setSuccess(true);
-            response.setMatchIndex(prev);
+            return response;
         }
-        response.setTerm(metaStore.currentTerm());
 
-        // TODO(CP-3)：闸3 追加条目 + leaderCommit 传播；CP-2 只做心跳压制
-        if (request.getEntries() != null && !request.getEntries().isEmpty()) {
-            log.warn("收到带 {} 条目的 AppendEntries，条目应用由 CP-3 提供",
-                    request.getEntries().size());
+        // 条目预检（防御：leader 侧按 nextIndex 逐号组装 + Base64 编码，正常
+        // 不会触发）——连续性与解码都在动日志之前完成，失败不产生半截状态
+        byte[][] payloads = new byte[entryCount][];
+        for (int i = 0; i < entryCount; i++) {
+            LogEntryData entry = entries.get(i);
+            if (entry.getIndex() != prev + 1 + i) {
+                log.error("AppendEntries 条目不连续: prev={}, 第 {} 条 index={}",
+                        prev, i, entry.getIndex());
+                response.setTerm(metaStore.currentTerm());
+                response.setSuccess(false);
+                response.setMatchIndex(-1);
+                return response;
+            }
+            try {
+                payloads[i] = Base64.getDecoder().decode(entry.getPayload());
+            } catch (IllegalArgumentException e) {
+                log.error("AppendEntries 条目 Base64 解码失败: 第 {} 条 index={}",
+                        i, entry.getIndex());
+                response.setTerm(metaStore.currentTerm());
+                response.setSuccess(false);
+                response.setMatchIndex(-1);
+                return response;
+            }
         }
+
+        // 闸3：冲突截断 + 追加（同号同 term 的重复条目幂等跳过）
+        if (entryCount > 0) {
+            long expect = prev + 1;
+            int matched = 0;
+            while (matched < entryCount
+                    && expect <= raftLog.lastIndex()
+                    && raftLog.termAt(expect) == entries.get(matched).getTerm()) {
+                expect++;
+                matched++;
+            }
+            if (matched < entryCount) {
+                if (expect <= raftLog.lastIndex()) {
+                    // 冲突尾巴整段截断（保留 [firstIndex, expect-1]）
+                    raftLog.truncateAfter(expect - 1);
+                }
+                for (int i = matched; i < entryCount; i++) {
+                    raftLog.append(entries.get(i).getTerm(), payloads[i]);
+                }
+                // 一轮 fsync 覆盖本请求全部条目（组刷盘），fsync 后才回 true
+                raftLog.flush();
+                logDirty = false;
+            }
+        }
+
+        // leaderCommit 传播：apply (lastApplied, min(leaderCommit, lastIndex)]
+        long newCommit = Math.min(request.getLeaderCommit(), raftLog.lastIndex());
+        if (newCommit > commitIndex) {
+            commitIndex = newCommit;
+            updateViews();
+            applyCommitted();
+        }
+
+        response.setTerm(metaStore.currentTerm());
+        response.setSuccess(true);
+        // 已对齐 + 本请求条目全部落盘的位点（leader 据此推进 matchIndex）
+        response.setMatchIndex(prev + entryCount);
+        response.setLastLogIndex(raftLog.lastIndex());
+        response.setLastLogTerm(raftLog.lastTerm());
         return response;
     }
 
     /**
      * 复制应答（状态线程）。
      *
-     * <p>CP-2 范围内只做规则一退位与健康位记录；matchIndex 推进、nextIndex
-     * 回退与多数派提交在 CP-3 随条目复制一并接入。</p>
+     * <p>success → matchIndex 推进（只增不减，防乱序旧应答）+ 多数派提交，
+     * 尚有缺口则立即续传（流水线）；failure → nextIndex 回退——优先利用
+     * 应答回带的日志尾线索跳跃，保底退一格，随后立即重发。传输失败
+     * （{@code null}）不重试，下一轮心跳自然补上（幂等：闸2/闸3 处理重复）。</p>
      *
      * @param peerId 应答方
      * @param response 应答；传输失败为 {@code null}
@@ -491,10 +613,48 @@ public final class RaftNode implements Closeable {
             return;
         }
         recordPeerSeen(peerId);
+        // 规则一：应答带更高 term → 立即退位
         if (response.getTerm() > metaStore.currentTerm()) {
             stepDown(response.getTerm());
+            return;
         }
-        // TODO(CP-3)：success → matchIndex 推进 + tryCommit；failure → nextIndex 回退重发
+        if (role != RaftRole.LEADER) {
+            return;
+        }
+        // 迟到应答（term 落后于本朝）作废：位点推进只信本朝确认
+        if (response.getTerm() < metaStore.currentTerm()) {
+            return;
+        }
+        ClusterMember peer = memberById(peerId);
+        if (peer == null) {
+            return;
+        }
+        if (response.isSuccess()) {
+            long match = response.getMatchIndex();
+            long known = matchIndex.getOrDefault(peerId, 0L);
+            if (match > known) {
+                matchIndex.put(peerId, match);
+            }
+            long next = Math.max(nextIndex.getOrDefault(peerId, 1L), match + 1);
+            nextIndex.put(peerId, next);
+            tryCommit();
+            // 该 follower 仍有缺口 → 立即续传（不等下一轮心跳）
+            if (nextIndex.getOrDefault(peerId, raftLog.lastIndex() + 1)
+                    <= raftLog.lastIndex()) {
+                sendAppendTo(peer);
+            }
+        } else {
+            // 闸2 被拒：利用回带的日志尾线索跳跃回退，保底退一格、不低于 1
+            long next = nextIndex.getOrDefault(peerId, raftLog.lastIndex() + 1);
+            long retreated = Math.min(next - 1, response.getLastLogIndex() + 1);
+            retreated = Math.max(retreated, 1L);
+            if (retreated >= next) {
+                retreated = Math.max(next - 1, 1L);
+            }
+            nextIndex.put(peerId, retreated);
+            log.debug("复制被拒回退: peer={}, nextIndex {} -> {}", peerId, next, retreated);
+            sendAppendTo(peer);
+        }
     }
 
     // ==================== 选举（状态线程） ====================
@@ -556,6 +716,7 @@ public final class RaftNode implements Closeable {
         // no-op 先追加再初始化各 peer 位点：旧 term 条目经它连带提交
         long noOpIndex = raftLog.append(metaStore.currentTerm(), NO_OP);
         raftLog.flush();
+        logDirty = false;
         long next = noOpIndex + 1;
         for (ClusterMember member : members) {
             nextIndex.put(member.getNodeId(), next);
@@ -578,6 +739,9 @@ public final class RaftNode implements Closeable {
         votesGranted = 0;
         if (wasLeader) {
             cancelHeartbeatTimer();
+            // D5：step-down 丢弃在途水位——在途写一律失败，客户端重试新 leader
+            failWaiters(new PolyConfigException(ErrorCode.UNAVAILABLE,
+                    "leader 已退位，在途写未提交，请重试"));
         }
         resetElectionTimer();
         updateViews();
@@ -655,7 +819,20 @@ public final class RaftNode implements Closeable {
                 heartbeatMillis, heartbeatMillis, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * 单条消息批量上限：限制单条 AppendEntries 的条目数，避免超大 JSON 报文。
+     */
+    private static final int MAX_ENTRIES_PER_APPEND = 256;
+
     private void sendHeartbeats() {
+        replicateToPeers();
+    }
+
+    /**
+     * 向全体 follower 推送（状态线程）：逐 peer 按 nextIndex 组装条目，
+     * 无条目即心跳。
+     */
+    private void replicateToPeers() {
         if (closed || role != RaftRole.LEADER) {
             return;
         }
@@ -663,18 +840,39 @@ public final class RaftNode implements Closeable {
             if (peer.getNodeId().equals(nodeId)) {
                 continue;
             }
-            long next = nextIndex.getOrDefault(peer.getNodeId(), raftLog.lastIndex() + 1);
-            long prev = next - 1;
-            AppendEntriesRequest request = new AppendEntriesRequest();
-            request.setTerm(metaStore.currentTerm());
-            request.setLeaderId(nodeId);
-            request.setPrevLogIndex(prev);
-            request.setPrevLogTerm(prev == 0 ? 0 : raftLog.termAt(prev));
-            request.setLeaderCommit(commitIndex);
-            request.setEntries(Collections.emptyList());
-            transport.sendAppend(peer, request,
-                    resp -> deliverAppendResponse(peer.getNodeId(), resp));
+            sendAppendTo(peer);
         }
+    }
+
+    /**
+     * 给单个 follower 组装并发送 AppendEntries（状态线程）：
+     * prev 凭据取 nextIndex-1 的接缝，条目取 [nextIndex, lastIndex] 的批量切片。
+     *
+     * @param peer 目标 follower
+     */
+    private void sendAppendTo(ClusterMember peer) {
+        if (closed || role != RaftRole.LEADER) {
+            return;
+        }
+        long next = nextIndex.getOrDefault(peer.getNodeId(), raftLog.lastIndex() + 1);
+        long prev = next - 1;
+        AppendEntriesRequest request = new AppendEntriesRequest();
+        request.setTerm(metaStore.currentTerm());
+        request.setLeaderId(nodeId);
+        request.setPrevLogIndex(prev);
+        request.setPrevLogTerm(prev == 0 ? 0 : raftLog.termAt(prev));
+        request.setLeaderCommit(commitIndex);
+        List<LogEntryData> entries = new ArrayList<>();
+        long lastIndex = raftLog.lastIndex();
+        for (long index = next; index <= lastIndex && entries.size() < MAX_ENTRIES_PER_APPEND;
+                index++) {
+            RaftLogEntry entry = raftLog.read(index);
+            entries.add(new LogEntryData(index, entry.getTerm(),
+                    Base64.getEncoder().encodeToString(entry.getPayload())));
+        }
+        request.setEntries(entries);
+        transport.sendAppend(peer, request,
+                resp -> deliverAppendResponse(peer.getNodeId(), resp));
     }
 
     // ==================== 计时器与信箱（状态线程） ====================
@@ -748,6 +946,15 @@ public final class RaftNode implements Closeable {
         return members.size() / 2 + 1;
     }
 
+    private ClusterMember memberById(String peerId) {
+        for (ClusterMember member : members) {
+            if (member.getNodeId().equals(peerId)) {
+                return member;
+            }
+        }
+        return null;
+    }
+
     private void failWaiters(PolyConfigException cause) {
         for (CompletableFuture<Long> waiter : applyWaiters.values()) {
             waiter.completeExceptionally(cause);
@@ -780,5 +987,15 @@ public final class RaftNode implements Closeable {
      */
     long testLastIndex() {
         return raftLog.lastIndex();
+    }
+
+    /**
+     * 仅供测试：指定 index 的 term（状态线程外的近似读，测试在静止期调用）。
+     */
+    long testTermAt(long index) {
+        if (raftLog.isEmpty() || index > raftLog.lastIndex()) {
+            return -1L;
+        }
+        return raftLog.termAt(index);
     }
 }

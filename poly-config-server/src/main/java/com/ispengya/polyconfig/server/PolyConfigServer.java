@@ -20,6 +20,7 @@ import com.ispengya.polyconfig.server.remoting.DistroSyncProcessor;
 import com.ispengya.polyconfig.server.remoting.DistroVerifyProcessor;
 import com.ispengya.polyconfig.server.remoting.FetchProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftAppendProcessor;
+import com.ispengya.polyconfig.server.remoting.RaftForwardProcessor;
 import com.ispengya.polyconfig.server.remoting.RaftVoteProcessor;
 import com.ispengya.polyconfig.server.remoting.SubscribeProcessor;
 import com.ispengya.polyconfig.server.remoting.UnsubscribeProcessor;
@@ -162,12 +163,16 @@ public class PolyConfigServer {
                     remotingExecutor);
         }
         if (protocol instanceof RaftProtocol) {
-            // CP 内部协议（4xxx）：拉票与复制/心跳，消息一律进 RaftNode 单线程信箱
-            RaftNode raftNode = ((RaftProtocol) protocol).raftNode();
+            // CP 内部协议（4xxx）：拉票、复制/心跳与写转发，消息一律进 RaftNode 单线程信箱
+            RaftProtocol raftProtocol = (RaftProtocol) protocol;
+            RaftNode raftNode = raftProtocol.raftNode();
             this.remotingServer.registerProcessor(ProtocolCodes.RAFT_VOTE,
                     new RaftVoteProcessor(raftNode), remotingExecutor);
             this.remotingServer.registerProcessor(ProtocolCodes.RAFT_APPEND,
                     new RaftAppendProcessor(raftNode), remotingExecutor);
+            // 写转发（leader 侧）：非 leader 节点的写经此到达 leader
+            this.remotingServer.registerProcessor(ProtocolCodes.RAFT_FORWARD,
+                    new RaftForwardProcessor(raftProtocol), remotingExecutor);
         }
 
         this.changePusher = new ChangePusher(remotingServer, registry);
@@ -298,6 +303,15 @@ public class PolyConfigServer {
      */
     public int getSubscriptionCount() {
         return registry.subscriptionCount();
+    }
+
+    /**
+     * 返回配置服务（测试/诊断用：挂变更监听验证 apply 即推送钩子）。
+     *
+     * @return 配置服务
+     */
+    public ConfigService getConfigService() {
+        return configService;
     }
 
     private String resolveAdvertisedHost() {

@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -25,8 +26,9 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * {@link RaftNode} 单元测试（CP-2 验收：投票决策矩阵、规则一/规则二、
- * 单节点选举与写入、三节点唯一 leader 与换代）。
+ * {@link RaftNode} 单元测试（CP-2/CP-3 验收：投票决策矩阵、规则一/规则二、
+ * 单节点选举与写入、三节点唯一 leader 与换代、多节点复制提交、
+ * nextIndex 回退追平、图 8 旧 term 未提交条目不 apply）。
  */
 public class RaftNodeTest {
 
@@ -295,30 +297,165 @@ public class RaftNodeTest {
         }
     }
 
+    // ==================== CP-3 多节点复制与提交 ====================
+
     @Test
-    public void shouldRejectMultiNodeProposeUntilCp3() throws Exception {
+    public void shouldReplicateAndCommitOnMajority() throws Exception {
         DirectNetwork network = new DirectNetwork();
-        RaftNode n1 = newNode("n1", new String[]{"n1", "n2"}, network,
-                new CopyOnWriteArrayList<>(), null, 0L);
-        RaftNode n2 = newNode("n2", new String[]{"n1", "n2"}, network,
-                new CopyOnWriteArrayList<>(), null, 0L);
-        network.register("n1", n1);
-        network.register("n2", n2);
+        List<RaftNode> nodes = new ArrayList<>();
+        List<List<byte[]>> appliedAll = new ArrayList<>();
         try {
-            // n1 竞选：n2 未 start 但会应答拉票 → n1 拿到 2/2 当选
-            n1.forceElectionTimeout();
-            awaitTrue(() -> n1.role() == RaftRole.LEADER, 5000L, "n1 应当选");
-            try {
-                n1.propose(next -> new byte[]{1}).get(3, TimeUnit.SECONDS);
-                fail("CP-2 多节点写应明确拒绝");
-            } catch (ExecutionException e) {
-                assertTrue(e.getCause() instanceof PolyConfigException);
-                assertTrue("错误信息应指向 CP-3: " + e.getCause().getMessage(),
-                        e.getCause().getMessage().contains("CP-3"));
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                List<byte[]> applied = new CopyOnWriteArrayList<>();
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, applied, null, 0L);
+                network.register(id, node);
+                nodes.add(node);
+                appliedAll.add(applied);
+                node.start();
+            }
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "三节点应选出唯一 leader");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+
+            long index = leader.propose(next ->
+                    "cp3-write".getBytes(StandardCharsets.UTF_8))
+                    .get(3, TimeUnit.SECONDS);
+            assertTrue("业务条目应 ≥2", index >= 2);
+
+            // 多数派提交 → 全体 follower 经 leaderCommit 传播 apply（推送钩子同套）
+            for (int i = 0; i < nodes.size(); i++) {
+                final int nodeIndex = i;
+                awaitTrue(() -> appliedAll.get(nodeIndex).size() == 1
+                                && nodes.get(nodeIndex).commitIndex() >= index,
+                        5000L, "节点 " + nodes.get(i).nodeId() + " 应 apply 该条目");
+                assertEquals("cp3-write",
+                        new String(appliedAll.get(nodeIndex).get(0), StandardCharsets.UTF_8));
             }
         } finally {
-            n1.close();
-            n2.close();
+            for (RaftNode node : nodes) {
+                node.close();
+            }
+        }
+    }
+
+    @Test
+    public void shouldCatchUpLaggardViaNextIndexRetreat() throws Exception {
+        DirectNetwork network = new DirectNetwork();
+        List<RaftNode> nodes = new ArrayList<>();
+        List<List<byte[]>> appliedAll = new ArrayList<>();
+        try {
+            // n3 落在后面：不注册、不启动（收不到任何消息，也发不出竞选）
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                List<byte[]> applied = new CopyOnWriteArrayList<>();
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, applied, null, 0L);
+                if (!id.equals("n3")) {
+                    network.register(id, node);
+                    node.start();
+                }
+                nodes.add(node);
+                appliedAll.add(applied);
+            }
+            RaftNode laggard = nodes.get(2);
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "三节点应选出唯一 leader（n3 未注册不影响 2/3 多数）");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+
+            long index = leader.propose(next ->
+                    "before-laggard".getBytes(StandardCharsets.UTF_8))
+                    .get(3, TimeUnit.SECONDS);
+            // n1+n2 多数派即可提交（n3 不参与）
+            awaitTrue(() -> appliedAll.get(0).size() == 1 && appliedAll.get(1).size() == 1,
+                    5000L, "多数派节点应 apply");
+
+            // n3 加入：leader 首轮 prev 超前被闸2 拒绝 → 回带线索跳跃回退 → 全量追平
+            network.register("n3", laggard);
+            awaitTrue(() -> appliedAll.get(2).size() == 1
+                            && laggard.commitIndex() >= index,
+                    5000L, "落后的 n3 应经 nextIndex 回退追平");
+            assertEquals("before-laggard",
+                    new String(appliedAll.get(2).get(0), StandardCharsets.UTF_8));
+        } finally {
+            for (RaftNode node : nodes) {
+                node.close();
+            }
+        }
+    }
+
+    @Test
+    public void shouldNeverApplyUncommittedOldTermEntry() throws Exception {
+        // 图 8 用例：leader 孤立时追加的旧 term 条目不得被直接提交；
+        // 换代后新 leader 的同号条目把它截断——旧条目任何节点都不 apply。
+        DirectNetwork network = new DirectNetwork();
+        List<RaftNode> nodes = new ArrayList<>();
+        List<List<byte[]>> appliedAll = new ArrayList<>();
+        try {
+            for (String id : new String[]{"n1", "n2", "n3"}) {
+                List<byte[]> applied = new CopyOnWriteArrayList<>();
+                RaftNode node = newNode(id, new String[]{"n1", "n2", "n3"},
+                        network, applied, null, 0L);
+                network.register(id, node);
+                nodes.add(node);
+                appliedAll.add(applied);
+                node.start();
+            }
+            awaitTrue(() -> nodes.stream().filter(n -> n.role() == RaftRole.LEADER).count() == 1,
+                    8000L, "三节点应选出唯一 leader");
+            RaftNode leader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER).findFirst().get();
+            long term1 = leader.term();
+            String isolatedId = leader.nodeId();
+
+            // 孤立 leader（出站 + 入站全断）：无法取得多数派，旧 term 条目悬空
+            network.isolate(isolatedId);
+            CompletableFuture<Long> pending = leader.propose(next ->
+                    "old-term-write".getBytes(StandardCharsets.UTF_8));
+
+            // n2/n3 互联换代（n1 的拉票/应答全丢，不干扰计票）
+            awaitTrue(() -> nodes.stream()
+                            .filter(n -> n.role() == RaftRole.LEADER && n.term() > term1)
+                            .count() == 1,
+                    8000L, "存活节点应选出更高 term 的 leader");
+            RaftNode newLeader = nodes.stream()
+                    .filter(n -> n.role() == RaftRole.LEADER && n.term() > term1)
+                    .findFirst().get();
+            assertFalse("孤立的旧 leader 不得携带更高 term 再次当选",
+                    isolatedId.equals(newLeader.nodeId()));
+
+            // 解隔离：新 leader 的 AppendEntries 把冲突尾巴截断并教化其退位
+            network.heal(isolatedId);
+            try {
+                pending.get(5, TimeUnit.SECONDS);
+                fail("孤立 leader 的在途写应在退位时失败");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof PolyConfigException);
+                assertTrue("应为 UNAVAILABLE: " + e.getCause(),
+                        ((PolyConfigException) e.getCause()).getErrorCode()
+                                == ErrorCode.UNAVAILABLE);
+            }
+
+            // 收敛 = 条数与 term 双条件：旧 leader 截断前也是 2 条（index=2 还是旧 term）
+            awaitTrue(() -> nodes.stream().allMatch(n -> n.testLastIndex() == 2
+                            && n.testTermAt(2) == newLeader.term()),
+                    5000L, "全体日志应收敛（index=2 = 新 term 的 no-op）");
+            for (int i = 0; i < nodes.size(); i++) {
+                RaftNode node = nodes.get(i);
+                assertEquals("index=2 应为新 term 的 no-op",
+                        newLeader.term(), node.testTermAt(2));
+                for (byte[] payload : appliedAll.get(i)) {
+                    assertFalse("旧 term 未提交条目不得 apply: "
+                                    + new String(payload, StandardCharsets.UTF_8),
+                            new String(payload, StandardCharsets.UTF_8)
+                                    .contains("old-term-write"));
+                }
+            }
+        } finally {
+            for (RaftNode node : nodes) {
+                node.close();
+            }
         }
     }
 
@@ -367,7 +504,9 @@ public class RaftNodeTest {
                     .toPath();
             RaftLog log = existingLog != null ? existingLog : new RaftLog(raftDir);
             RaftMetaStore metaStore = new RaftMetaStore(raftDir.resolve("meta.json"));
-            return new RaftNode(nodeId, memberList, log, metaStore, network,
+            // 绑定发送方视图：DirectNetwork 的隔离检查依赖发送方身份
+            return new RaftNode(nodeId, memberList, log, metaStore,
+                    network.viewOf(nodeId),
                     (index, term, payload) -> applied.add(payload.clone()),
                     ELECTION_TIMEOUT, HEARTBEAT, recoveryCommit);
         } catch (java.io.IOException e) {

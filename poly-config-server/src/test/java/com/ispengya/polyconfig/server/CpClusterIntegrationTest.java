@@ -132,6 +132,250 @@ public class CpClusterIntegrationTest {
         }
     }
 
+    // ==================== CP-3 复制与提交 ====================
+
+    @Test
+    public void shouldWriteViaAnyNodeAndReadFromAllNodes() throws Exception {
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        try {
+            servers.add(startCpServer(folder.newFolder("cp3w-1").toPath(),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(folder.newFolder("cp3w-2").toPath(),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(folder.newFolder("cp3w-3").toPath(),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            // 写打到 follower（非 leader 节点）→ RAFT_FORWARD 到 leader 提交
+            int followerIndex = (leader.index + 1) % servers.size();
+            PolyConfigServer follower = servers.get(followerIndex);
+            Response publish = post(follower.getHttpPort(), "/v1/cs/configs",
+                    publishBody("cp3.yml", "via-follower", null));
+            assertEquals(200, publish.status);
+            assertEquals(0, JSON.parseObject(publish.body).getIntValue("code"));
+
+            // 全集群可读：三个节点各自 LOCAL 读，轮询直到复制+apply 追平
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "cp3.yml", "via-follower", 5000L);
+            }
+
+            // 409 经 follower 转发照样生效（leader 侧 D5 校验）
+            Response conflict = post(follower.getHttpPort(), "/v1/cs/configs",
+                    publishBody("cp3.yml", "again", -1L));
+            assertEquals(409, conflict.status);
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
+    @Test
+    public void shouldRejectWritesWhenMajorityDownAndRecoverWithoutLoss() throws Exception {
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<Path> dataDirs = new ArrayList<>();
+        try {
+            dataDirs.add(folder.newFolder("cp3m-1").toPath());
+            dataDirs.add(folder.newFolder("cp3m-2").toPath());
+            dataDirs.add(folder.newFolder("cp3m-3").toPath());
+            servers.add(startCpServer(dataDirs.get(0),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(dataDirs.get(1),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(dataDirs.get(2),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            Response publish = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("keep.yml", "before-down", null));
+            assertEquals(200, publish.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "keep.yml", "before-down", 5000L);
+            }
+
+            // 杀掉多数派（两个 follower）：leader 孤掌难鸣 → 写不可用（503）
+            List<Integer> stoppedIndexes = new ArrayList<>();
+            for (int i = 0; i < servers.size(); i++) {
+                if (i != leader.index) {
+                    killServer(servers.get(i));
+                    stoppedIndexes.add(i);
+                }
+            }
+            Response unavailable = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("keep.yml", "while-down", null));
+            assertEquals("多数派不可用时写应 503", 503, unavailable.status);
+
+            // 恢复多数派：一条不丢 + 自愈可写
+            for (int k = 0; k < stoppedIndexes.size(); k++) {
+                servers.set(stoppedIndexes.get(k), startCpServer(
+                        dataDirs.get(stoppedIndexes.get(k)),
+                        nodeIds.get(stoppedIndexes.get(k)), THREE_MEMBERS,
+                        18866 + stoppedIndexes.get(k), 19866 + stoppedIndexes.get(k)));
+            }
+            // 恢复后终态：宕机期间超时的 while-down 写（index=3）也照常提交
+            // （前缀提交蕴含 before-down 未丢）；内容确定为 while-down
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "keep.yml", "while-down", 8000L);
+            }
+            // 对准 version=3（while-down 的 index）写入 → 200，同时断言版本链正确
+            Response recovered = post(servers.get(leader.index).getHttpPort(),
+                    "/v1/cs/configs", publishBody("keep.yml", "after-recovery", 3L));
+            assertEquals("恢复后 version 应为 3（while-down 写已提交）, body="
+                    + recovered.body, 200, recovered.status);
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "keep.yml", "after-recovery", 8000L);
+            }
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
+    @Test
+    public void shouldEnforceInFlightWatermarkWhileMajorityDown() throws Exception {
+        // D5：多数派宕机时写 A 追加未提交（在途），写 B 的 expectedVersion
+        // 必须对着"已 apply + 在途叠加"判定——-1（必须不存在）应 409，
+        // 对准 A 的 version 应放行（而非 409），随后超时 503。
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<Path> dataDirs = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                dataDirs.add(folder.newFolder("cp3d-" + (i + 1)).toPath());
+            }
+            servers.add(startCpServer(dataDirs.get(0),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(dataDirs.get(1),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(dataDirs.get(2),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+            PolyConfigServer leaderServer = servers.get(leader.index);
+
+            // 杀两个 follower：leader 无法取得多数派，写进入在途状态
+            for (int i = 0; i < servers.size(); i++) {
+                if (i != leader.index) {
+                    killServer(servers.get(i));
+                }
+            }
+
+            // 写 A（no-op 占 1 号 → A 为 index 2 / version 2）：本地追加后挂起
+            Response writeA = post(leaderServer.getHttpPort(), "/v1/cs/configs",
+                    publishBody("d5.yml", "d5-content", null));
+            assertEquals("多数派不可用时写 A 应 503（条目留在日志里在途）",
+                    503, writeA.status);
+
+            // 写 B1：expectedVersion=-1（必须不存在）→ 叠加水位看到在途 A → 409
+            long start = System.currentTimeMillis();
+            Response writeB1 = post(leaderServer.getHttpPort(), "/v1/cs/configs",
+                    publishBody("d5.yml", "b1", -1L));
+            long elapsed = System.currentTimeMillis() - start;
+            assertEquals("在途 A 应被叠加水位挡住 → 409, body=" + writeB1.body,
+                    409, writeB1.status);
+            assertTrue("409 应即时返回而非等到提交超时: " + elapsed + "ms", elapsed < 2000L);
+
+            // 写 B2：expectedVersion=2（正是 A 分配的 version）→ 叠加判定通过，
+            // 追加后同样因多数派不可用超时 503（若水位缺失会先撞 -1 视图报 409）
+            Response writeB2 = post(leaderServer.getHttpPort(), "/v1/cs/configs",
+                    publishBody("d5.yml", "d5-content", 2L));
+            assertEquals("对准在途 version 的写应放行后超时（而非 409）",
+                    503, writeB2.status);
+
+            // 恢复多数派：在途条目照常提交（A 与 B2 都在日志里，后写覆盖）
+            List<PolyConfigServer> restarted = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                if (i != leader.index) {
+                    servers.set(i, startCpServer(dataDirs.get(i), nodeIds.get(i),
+                            THREE_MEMBERS, 18866 + i, 19866 + i));
+                    restarted.add(servers.get(i));
+                }
+            }
+            for (PolyConfigServer server : servers) {
+                awaitContent(server, "d5.yml", "d5-content", 8000L);
+            }
+            Response read = get(leaderServer.getHttpPort(),
+                    "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=d5.yml");
+            JSONObject data = JSON.parseObject(read.body).getJSONObject("data");
+            assertTrue("最终 version 应为 3（B2 的 index，A=2 已提交被覆盖）: "
+                            + data.getLongValue("version"),
+                    data.getLongValue("version") >= 3L);
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
+    @Test
+    public void shouldFireChangeListenerOnEveryNodeWhenWritten() throws Exception {
+        // apply 即推送钩子：写一次，三个节点的状态机 apply 都要触发监听
+        List<PolyConfigServer> servers = new ArrayList<>();
+        List<String> nodeIds = new ArrayList<>();
+        List<java.util.concurrent.CountDownLatch> latches = new ArrayList<>();
+        try {
+            servers.add(startCpServer(folder.newFolder("cp3p-1").toPath(),
+                    "node-1", THREE_MEMBERS, 18866, 19866));
+            nodeIds.add("node-1");
+            servers.add(startCpServer(folder.newFolder("cp3p-2").toPath(),
+                    "node-2", THREE_MEMBERS, 18867, 19867));
+            nodeIds.add("node-2");
+            servers.add(startCpServer(folder.newFolder("cp3p-3").toPath(),
+                    "node-3", THREE_MEMBERS, 18868, 19868));
+            nodeIds.add("node-3");
+            LeaderSnapshot leader = awaitExactlyOneLeader(servers, nodeIds, 8000L);
+
+            for (PolyConfigServer server : servers) {
+                java.util.concurrent.CountDownLatch latch =
+                        new java.util.concurrent.CountDownLatch(1);
+                latches.add(latch);
+                server.getConfigService().addChangeListener(event -> latch.countDown());
+            }
+
+            int followerIndex = (leader.index + 1) % servers.size();
+            Response publish = post(servers.get(followerIndex).getHttpPort(),
+                    "/v1/cs/configs", publishBody("push.yml", "push-me", null));
+            assertEquals(200, publish.status);
+
+            for (int i = 0; i < servers.size(); i++) {
+                assertTrue("节点 " + nodeIds.get(i) + " 应触发变更监听（apply 即推送）",
+                        latches.get(i).await(5, java.util.concurrent.TimeUnit.SECONDS));
+            }
+        } finally {
+            for (PolyConfigServer server : servers) {
+                try {
+                    server.stop();
+                } catch (RuntimeException ignored) {
+                    // 已停止的节点重复停止
+                }
+            }
+        }
+    }
+
     // ==================== 辅助 ====================
 
     private static PolyConfigServer startCpServer(Path dataDir, String nodeId,
@@ -206,6 +450,35 @@ public class CpClusterIntegrationTest {
         }
         fail("集群状态中缺少节点 " + nodeId);
         return null;
+    }
+
+    /**
+     * 杀节点（测试故障注入）：先秒级关闭协议让 Raft 立刻退出，再走优雅停机
+     * 清理网络——否则 stop 的 2~7 秒窗口内被停节点仍参与选举，会把真 leader
+     * 拉下马，干扰"多数派不可用"类断言。协议 close 幂等，后续 stop 无害。
+     */
+    private static void killServer(PolyConfigServer server) {
+        server.getConfigService().close();
+        server.stop();
+    }
+
+    private static void awaitContent(PolyConfigServer server, String dataId,
+                                     String expectedContent, long timeoutMillis)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            Response read = get(server.getHttpPort(),
+                    "/v1/cs/configs?namespace=public&group=DEFAULT_GROUP&dataId=" + dataId);
+            if (read.status == 200) {
+                JSONObject data = JSON.parseObject(read.body).getJSONObject("data");
+                if (data != null && expectedContent.equals(data.getString("content"))) {
+                    return;
+                }
+            }
+            Thread.sleep(50L);
+        }
+        fail("节点 " + server.getHttpPort() + " 上 " + dataId
+                + " 未在 " + timeoutMillis + "ms 内读到内容 " + expectedContent);
     }
 
     private static String publishBody(String dataId, String content, Long expectedVersion) {

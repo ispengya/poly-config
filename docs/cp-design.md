@@ -1,7 +1,7 @@
 # poly-config CP（Raft）设计
 
-> 状态：CP-1/CP-2 已完成（日志底座与选举），进行中 CP-3（复制与提交）
-> 更新：2026-11-07
+> 状态：CP-1/CP-2/CP-3 已完成（日志底座、选举、复制与提交），进行中 CP-4（读与快照）
+> 更新：2026-11-08
 > 前置阅读：product-form.md（CP 路线 = 手写 Raft）、ap-design.md（工程模式参照）
 
 ## 1. 形态定案
@@ -292,7 +292,7 @@ ConfigProtocol
 |---|---|---|
 | CP-1（✅ 2026-11-07） | `RaftLog`：帧带 index/term、尾部截断 `truncateAfter`、前缀压缩接入、索引重建；`raft-meta` 持久化（fsync 语义）；恢复回放 | 单机写→崩溃重启逐号恢复；冲突尾巴截断后重启不复活；meta 丢失回退不越权 |
 | CP-2（✅ 2026-11-07） | `RaftNode` 单线程信箱 + 三角色；RequestVote 两道闸；随机超时/心跳压制；`--mode=cp` 装配放行（先单节点） | 单节点 cp 启动写通；3 节点选出唯一 leader；杀 leader 毫秒级重选；双投/双主单测打不穿 |
-| CP-3 | AppendEntries 三闸 + nextIndex 回退；commit 本 term 限定 + no-op；commit→apply 循环（推送钩子）；D5 水位；RAFT_FORWARD 写转发 + expectedVersion；组刷盘升级 | 写任意节点→全集群提交可读、三节点客户端收推送；409 照常；2/3 宕机写不可用但一条不丢、恢复自愈；图 8 用例固化成测试 |
+| CP-3（✅ 2026-11-08） | AppendEntries 三闸 + nextIndex 回退；commit 本 term 限定 + no-op；commit→apply 循环（推送钩子）；D5 水位；RAFT_FORWARD 写转发 + expectedVersion；组刷盘升级 | 写任意节点→全集群提交可读、三节点客户端收推送；409 照常；2/3 宕机写不可用但一条不丢、恢复自愈；图 8 用例固化成测试 |
 | CP-4 | read-index（LINEARIZABLE）；快照带 lastIncluded；InstallSnapshot 追平落后 follower | 线性一致读测试（选举窗口不回退）；快照压缩后杀 follower→重启一发追平；滚动重启收敛 |
 | CP-5 | SDK `getConfig` 加 ReadConsistency 重载（D8）；错误语义（选举中/无主提示）；RAFT_STATUS + 控制台 CP 视图（leader/term/commitIndex/peer matchIndex）；三节点测试矩阵；文档定稿 | 完整演示：杀 leader 换代、写读按语义正确；矩阵全绿；本文档补实施记录 |
 
@@ -352,9 +352,53 @@ ConfigProtocol
   全量 **123 通过**。Java 8 API 合规经 `--release 8` 严格编译验证（修正
   `List.copyOf`/无参 `orElseThrow` 两处 Java 10 API——JDK17 下 `-source 8` 不带
   `--release` 会假绿，须以 `--release 8` 为准）。
-- **CP-3 待接**（代码 TODO 已标注）：闸3 条目追加与截断、nextIndex 回退（含
-  拒绝回带线索）、leaderCommit 传播、success→matchIndex→tryCommit、
-  RAFT_FORWARD 写转发、组刷盘升级、D5 多成员在途叠加水位。
+### CP-3 实施记录（2026-11-08，已完成）
+
+- **三闸落地**（`RaftNode.handleAppendRequest`）：闸1 term（过期 leader 拒绝回带
+  本朝 term）；闸2 prev 接缝（拒绝回带 lastLogIndex/lastLogTerm 线索）；闸3 =
+  连续性+Base64 **全量预检（先校验后动日志，失败不留半截状态）** → 冲突尾巴
+  `truncateAfter` 截断 → 追加 → 一轮 fsync 后才回 true。重复条目（同号同 term）
+  幂等跳过。`leaderCommit` 传播：`commitIndex = min(leaderCommit, lastIndex)` 推进
+  后走同一套 commit→apply（推送钩子不变）。
+- **复制与回退**：propose 追加后立即 `replicateToPeers`（不等心跳）；心跳 = 按
+  逐 peer `nextIndex` 组装的 AppendEntries（空条目即心跳，单条批量上限 256）。
+  应答处理：success → matchIndex 只增不减（防乱序旧应答）→ tryCommit → 仍有缺口
+  立即续传；failure → `min(next-1, 回带线索+1)` 跳跃回退、保底退 1、立即重发
+  （prev=0 必对齐，回退有下界不会死循环）。迟到应答（term 落后本朝）作废。
+  同 peer 并发发送可能乱序——位点推进用 max/幂等兜底，安全但偶发冗余重发，
+  per-peer 串行化留后续打磨。
+- **组刷盘升级**：propose 的本地追加不立即 fsync，入队尾部"刷盘+提交"任务——
+  队列中后续追加被同一轮 fsync 覆盖（多写共享一次磁盘动作）；follower 侧一轮
+  AppendEntries 全部条目只 fsync 一次。**先持久化再计票**：leader 自身
+  matchIndex 只在 fsync 完成后推进（未刷盘不计入多数派）。
+- **D5 在途叠加水位**：`RaftProtocol.pendingWrites`（index → key+version，
+  并发容器）——propose 的 prepare 在状态线程内"先查叠加水位再 put"，校验底账 =
+  已 apply 状态机 + 本 leader 在途写；propose 完成（apply 成功 / step-down 失败）
+  即移除；**step-down 时 `failWaiters` 使在途写一律失败**（客户端重试新 leader）。
+  写提交超时 = `max(3s, 3×选举超时)`：超时只放弃客户端等待，条目与水位保留到
+  apply/step-down（恢复后照常提交，at-least-once）。
+- **RAFT_FORWARD（4004）**：非 leader 收写 → 转发 leader `proposeLocal`（角色闸
+  拒绝、不二次转发）；leader 应答 = commit+apply（D7），携带 mutation+index；
+  转发节点按该 version **提前 apply**（写后即读闭环），随后 AppendEntries 送达
+  同 index 时幂等跳过。幂等三闸（`applyFromLog`/`applyForwarded` 方法级互斥）：
+  per-key 提前 apply 水位（挡同条重放与低 index 旧条晚到）+ 状态机已有同版或
+  更新 + 删除遇 key 已不存在；转发路径另以 `logAppliedRevision` 连续位点判
+  "日志已按序走过本条"。错误码映射与 AP 转发同款（409/404/500→UNAVAILABLE）。
+- **装配**：`PolyConfigServer` 在 mode=cp 注册 RAFT_FORWARD 处理器
+  （`RaftForwardProcessor`，与 DistroForwardProcessor 同构）。
+- **测试**（全量 **129 通过**）：
+  - `RaftNodeTest` 13：CP-2 的 11 项 + 多节点复制提交、落后 follower 经
+    nextIndex 回退追平、**图 8 用例**（孤立 leader 的旧 term 在途写不提交、
+    换代后被截断不复活、退位时在途写失败——`DirectNetwork` 新增
+    isolate/heal + 发送方视图 `viewOf` 支撑非对称分区）。
+  - `CpClusterIntegrationTest` 6：CP-2 的 2 项 + 写任意节点→全集群可读 +
+    409 经转发、2/3 宕机写 503 + 恢复一条不丢自愈、**D5 在途水位**
+    （-1 被在途写挡住 409 即时返回、对准在途 version 放行后超时、恢复后
+    超时写照常提交 version 链正确）、三节点变更监听全触发（apply 即推送钩子）。
+- **测试基建教训**：`PolyConfigServer.stop()` 是 2~7s 的优雅停机，窗口内被停
+  节点的 Raft 仍活着会参与选举、把真 leader 拉下马——故障注入须用
+  `killServer`（先秒级 `getConfigService().close()` 关协议、再 stop 清理网络；
+  协议 close 幂等）。
 
 ### 测试策略
 

@@ -8,6 +8,11 @@
         </encoder>
     </appender>
 
+    <!-- 心跳重试（默认 100ms）对不可达节点会逐次 reconnect 并打 WARN——高频噪音。
+         可达性变化已由 Raft 传输层"节点不可达/恢复可达"单次提示，这里压到 ERROR，
+         其他异常仍可见。 -->
+    <logger name="com.ispengya.remoting.netty.NettyRemotingClient" level="ERROR"/>
+
     <!-- 按需对单包开 debug：<logger name="com.ispengya.polyconfig" level="DEBUG"/> -->
     <root level="INFO">
         <appender-ref ref="STDOUT"/>

@@ -721,10 +721,10 @@ public final class RaftNode implements Closeable {
             metaStore.persist(metaStore.currentTerm(), request.getCandidateId());
             resetElectionTimer();
             response.setVoteGranted(true);
-            log.debug("投出选票: term={}, candidate={}",
+            log.info("投出选票: term={}, candidate={}",
                     metaStore.currentTerm(), request.getCandidateId());
         } else {
-            log.debug("拒绝选票: term={}, candidate={}, canVote={}, logUpToDate={}",
+            log.info("拒绝选票: term={}, candidate={}, canVote={}, logUpToDate={}",
                     metaStore.currentTerm(), request.getCandidateId(), canVote, logUpToDate);
         }
         return response;
@@ -751,10 +751,11 @@ public final class RaftNode implements Closeable {
             return;
         }
         if (!response.isVoteGranted()) {
+            log.info("对端拒绝选票: peer={}", peerId);
             return;
         }
         votesGranted++;
-        log.debug("收到选票: peer={}, votes={}/{})", peerId, votesGranted, majority());
+        log.info("收到选票: peer={}, votes={}/{}", peerId, votesGranted, majority());
         if (votesGranted >= majority()) {
             becomeLeader();
         }
@@ -945,7 +946,7 @@ public final class RaftNode implements Closeable {
                 retreated = Math.max(next - 1, 1L);
             }
             nextIndex.put(peerId, retreated);
-            log.debug("复制被拒回退: peer={}, nextIndex {} -> {}", peerId, next, retreated);
+            log.info("复制被拒回退: peer={}, nextIndex {} -> {}", peerId, next, retreated);
             sendAppendTo(peer);
         }
     }
@@ -1206,6 +1207,8 @@ public final class RaftNode implements Closeable {
 
     private void becomeFollower(String newLeaderId) {
         boolean wasLeader = role == RaftRole.LEADER;
+        boolean wasCandidate = role == RaftRole.CANDIDATE;
+        String previousLeaderId = leaderId;
         role = RaftRole.FOLLOWER;
         leaderId = newLeaderId == null ? "" : newLeaderId;
         electionTerm = 0;
@@ -1218,6 +1221,16 @@ public final class RaftNode implements Closeable {
             // CP-4：在途线性读全部作废（选举窗口不回退），客户端重试新 leader
             failPendingReads(new PolyConfigException(ErrorCode.UNAVAILABLE,
                     "leader 已切换，线性读作废，请重试"));
+            log.info("leader 退位为 follower: 新 leader={}, term={}",
+                    leaderId.isEmpty() ? "未定" : leaderId, metaStore.currentTerm());
+        } else if (wasCandidate) {
+            // 落选/选举被更高届打断：此前该路径完全静默，看不出选举结果
+            log.info("候选人回退 follower: leader={}, term={}",
+                    leaderId.isEmpty() ? "未定" : leaderId, metaStore.currentTerm());
+        } else if (!leaderId.isEmpty() && !leaderId.equals(previousLeaderId)) {
+            // 普通 follower 认领 leader（重启后首次收到心跳 / 换主后首次心跳）：
+            // 否则重启节点日志里查不到"现在跟的是谁"
+            log.info("认领 leader: leader={}, term={}", leaderId, metaStore.currentTerm());
         }
         resetElectionTimer();
         updateViews();
@@ -1423,7 +1436,7 @@ public final class RaftNode implements Closeable {
         SnapshotData data = snapshotAccess.currentSnapshot();
         if (data == null || data.getLastIncludedIndex() <= 0) {
             // 回退触界但无快照可发（理论上仅快照尚未落盘的窗口）：等落盘后下轮心跳再试
-            log.debug("触到快照边界但暂无快照可发: peer={}, firstIndex={}",
+            log.info("触到快照边界但暂无快照可发: peer={}, firstIndex={}",
                     peer.getNodeId(), raftLog.firstIndex());
             return;
         }

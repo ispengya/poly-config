@@ -119,7 +119,7 @@ public final class RaftMetaStore {
 
         this.currentTerm = newTerm;
         this.votedFor = newVotedFor;
-        log.debug("Raft 元数据落盘: term={}, votedFor={}", newTerm, newVotedFor);
+        log.info("Raft 元数据落盘: term={}, votedFor={}", newTerm, newVotedFor);
     }
 
     private void load() {

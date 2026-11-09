@@ -424,7 +424,7 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
         // 提前 apply：写后即读闭环（幂等守卫兜住稍后送达的同 index 条目）
         ConfigCommand applied = toCommand(result);
         applyForwarded(applied, result.getRevision(), result.getVersion());
-        log.debug("写转发完成, leader={}, key={}, version={}",
+        log.info("写转发完成, leader={}, key={}, version={}",
                 leader.getNodeId(), command.getKey().toPath(), result.getVersion());
         return new MutationResult(applied.getKey(), result.getVersion(),
                 result.getRevision(), result.getMd5());
@@ -696,7 +696,7 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
                 try {
                     details.add(localDetail());
                 } catch (RuntimeException e) {
-                    log.debug("本地详细状态构建失败", e);
+                    log.info("本地详细状态构建失败", e);
                     details.add(staticDetail(member));
                 }
                 continue;
@@ -718,7 +718,7 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
                 }
                 details.add(staticDetail(member));
             } catch (Exception e) {
-                log.debug("状态采集失败, peer={}: {}", member.getNodeId(), e.toString());
+                log.info("状态采集失败, peer={}: {}", member.getNodeId(), e.toString());
                 details.add(staticDetail(member));
             }
         }
@@ -833,7 +833,7 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
         ConfigCommand command = CommandCodec.decode(payload);
         Long assigned = command.getAssignedVersion();
         applyFromLog(command, index, assigned != null ? assigned : index);
-        log.debug("apply 已提交条目: index={}, term={}, op={}, key={}",
+        log.info("apply 已提交条目: index={}, term={}, op={}, key={}",
                 index, term, command.getOperation(), command.getKey());
         maybeTriggerSnapshot(index, term);
     }
@@ -914,13 +914,13 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
         ConfigKey key = command.getKey();
         Long watermark = earlyWatermark.get(key);
         if (watermark != null && version <= watermark) {
-            log.debug("幂等跳过（已被提前 apply 或更旧）: key={}, version={}, watermark={}",
+            log.info("幂等跳过（已被提前 apply 或更旧）: key={}, version={}, watermark={}",
                     key.toPath(), version, watermark);
             logAppliedRevision = revision;
             return;
         }
         if (isSuperseded(command, version)) {
-            log.debug("幂等跳过（状态机已有同版或更新）: key={}, version={}",
+            log.info("幂等跳过（状态机已有同版或更新）: key={}, version={}",
                     key.toPath(), version);
             logAppliedRevision = revision;
             return;
@@ -940,18 +940,18 @@ public class RaftProtocol implements ConfigProtocol, RaftSnapshotAccess {
     private synchronized void applyForwarded(ConfigCommand command, long revision,
                                              long version) {
         if (revision <= logAppliedRevision) {
-            log.debug("幂等跳过（日志路径已按序 apply）: key={}, revision={}",
+            log.info("幂等跳过（日志路径已按序 apply）: key={}, revision={}",
                     command.getKey().toPath(), revision);
             return;
         }
         ConfigKey key = command.getKey();
         Long watermark = earlyWatermark.get(key);
         if (watermark != null && version <= watermark) {
-            log.debug("幂等跳过（已提前 apply）: key={}, version={}", key.toPath(), version);
+            log.info("幂等跳过（已提前 apply）: key={}, version={}", key.toPath(), version);
             return;
         }
         if (isSuperseded(command, version)) {
-            log.debug("幂等跳过（状态机已有同版或更新）: key={}, version={}",
+            log.info("幂等跳过（状态机已有同版或更新）: key={}, version={}",
                     key.toPath(), version);
             return;
         }

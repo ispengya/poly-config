@@ -1,43 +1,31 @@
 # poly-config
 
-多一致性配置中心：独立部署的 Server 集群 + Java SDK + Web 控制台，支持 **standalone / CP / AP** 三种模式，部署时切换。
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="poly-config：一套代码支持 standalone、CP（Raft）、AP（Distro）三种一致性的配置中心">
+</p>
 
-同一个数据模型（namespace → group → dataId）、同一套 HTTP OpenAPI 与 SDK；集群模式下通过服务端内部协议完成一致性，客户端无感知。
+一个用同一套代码实现 **三种一致性模式** 的配置中心：`standalone` 单机、`CP`（手写 Raft）、`AP`（Distro 式）。数据模型、HTTP API、Java SDK 与 Web 控制台完全一致，差异收敛在服务端协议层——**部署时切换，而不是换一个产品**。
 
-> 当前状态：v1 功能范围已全部落地——M0 单机核心链路、AP（Distro）与 CP（Raft）两条集群路线均已完成并通过三节点测试矩阵。
+项目重点不在配置 CRUD，而在分布式场景下的工程实现：日志与快照存储、Raft 选举与复制、Distro 反熵收敛、服务端推送，以及这些机制在真实故障下的行为。
 
-## 特性
+[三种模式](#三种部署模式) · [快速开始](#快速开始) · [Java SDK](#java-sdk) · [HTTP API](#http-api) · [设计文档](#设计文档)
 
-- **三种部署模式**：`standalone`（单机）、`cp`（手写 Raft：单 leader、多数派提交、快照、线性读）、`ap`（Distro 式：分片写责任 + 异步复制 + 周期校验/反熵）
-- **HTTP OpenAPI + Web 控制台**：配置 CRUD、历史、回滚、集群状态；控制台由 server 提供静态资源，打开任意节点即可管理全集群
-- **Java SDK**：长连接 + 服务端主动推送、本地快照、断线重连、多地址故障转移、批量对账
-- **纯内嵌存储**：自研分段日志（CRC、滚动、尾部截断、刷盘、组提交）+ 原子快照，不依赖外部数据库
-- **写后即读**：写经过的节点在应答前先本地 apply；版本按 key 单调，客户端视角不回退
-- **可观测**：控制台集群页（节点角色、任期、提交/apply 位点、复制水位），关键事件日志（选举、投票、复制、可达性）
+## 三种部署模式
 
-## 架构
+<p align="center">
+  <img src="./assets/readme/modes.svg" width="100%" alt="三种部署模式：standalone 单机本地日志；CP 三节点 Raft 多数派提交；AP 三节点异步复制与周期校验">
+</p>
 
-```
-业务应用 ──SDK（Netty 长连接 / 变更推送）──┐
-浏览器   ──HTTP OpenAPI（同源控制台）─────┤
-                                          ▼
-                          poly-config server 集群
-                          ┌────────────────────────────────┐
-                          │ HTTP API + 控制台静态资源        │
-                          │ ConfigProtocol                  │
-                          │  ├─ LocalProtocol   (standalone)│
-                          │  ├─ RaftProtocol    (cp)        │
-                          │  └─ DistroProtocol  (ap)        │
-                          │ ConfigService + 通知/订阅引擎    │
-                          │ 状态机（内存）+ 统一分段日志 + 快照│
-                          └────────────────────────────────┘
-```
+| | standalone | CP（Raft） | AP（Distro） |
+|---|---|---|---|
+| 一致性 | 单机即真相 | 强一致：多数派提交 | 最终一致：异步复制 + 周期校验收敛 |
+| 写路径 | 本地 | 任意节点收写 → 转发 leader，多数派落盘后提交 | 任意节点收写 → 转发分区 owner，owner 落盘即应答 |
+| 读路径 | 本地 | 默认 LOCAL；`LINEARIZABLE` 走 read-index | 默认 LOCAL；`LINEARIZABLE` 转发 owner |
+| leader/owner 故障 | — | 自动选主（约 1~2 个选举超时），已提交数据不丢 | 该分区写不可用，恢复后自愈（转移归 CP 路线） |
+| 复制机制 | — | Raft 日志复制，nextIndex 回退 / 快照追平 | 全量副本 + 分片写责任，异步推送 |
+| 成员管理 | — | 静态配置，变更需滚动重启 | 静态配置，变更需滚动重启 |
 
-| 模块 | 职责 |
-|---|---|
-| `poly-config-common` | 数据模型、协议 DTO、协议码、错误码、工具（读一致性枚举等） |
-| `poly-config-client` | Java SDK：连接、缓存、监听、本地快照、对账、故障转移 |
-| `poly-config-server` | 服务端：`storage`（分段日志/快照）、`consistency`（协议 SPI）、`core`（状态机/Raft/Distro）、`server`（启动装配/HTTP/Netty/控制台） |
+取舍是显式的：**AP 赢在写并行，CP 赢在不丢、秒级换主与确定性恢复**。
 
 ## 快速开始
 
@@ -55,6 +43,32 @@ mvn clean package -DskipTests
 
 产物为普通 jar（非 fat jar），运行期 classpath 由脚本/命令显式组装。
 
+### 三节点集群（推荐）
+
+```bash
+scripts/cp-cluster.sh up      # CP：3 server + 3 client，并实时跟随日志
+scripts/ap-cluster.sh up      # AP：同上
+```
+
+控制台：<http://127.0.0.1:8848/>（打开任意节点的控制台都能管理整个集群）
+
+| 节点 | HTTP | Remoting | 数据目录 |
+|---|---|---|---|
+| node-1 | 8848 | 9848 | `data/cp/node-1`（AP 为 `data/ap`） |
+| node-2 | 8849 | 9849 | `data/cp/node-2` |
+| node-3 | 8850 | 9850 | `data/cp/node-3` |
+
+| 脚本子命令 | 说明 |
+|---|---|
+| `up` | 启动并实时跟随全部日志（Ctrl+C 只退出跟随） |
+| `start` / `servers` / `clients` | 启动全部 / 仅 server / 仅 client（已在运行的跳过） |
+| `stop` | 停止全部 |
+| `status` | 查看进程与集群状态（CP 显示 leader） |
+| `logs [node-1\|client-2]` | 跟随单个或全部日志 |
+| `clean` | 停止并清空本地数据与日志 |
+
+> CP 脚本使用 300/50ms 的测试选举超时（与三节点测试矩阵一致），杀 leader 后亚秒级换代；删除对应参数即回到默认 1000/100。
+
 ### 单机启动
 
 ```bash
@@ -66,47 +80,8 @@ mvn -q -pl poly-config-server dependency:build-classpath \
 # Linux / macOS
 java -cp "poly-config-server/target/classes:poly-config-common/target/classes:$(cat poly-config-server/target/server-cp.txt)" \
     com.ispengya.polyconfig.server.PolyConfigServer --mode=standalone
-# Windows 把 classpath 分隔符 : 换成 ;（建议直接用集群脚本，见下）
+# Windows 把 classpath 分隔符 : 换成 ;（或直接用上面的集群脚本）
 ```
-
-控制台：<http://127.0.0.1:8848/>
-
-### 三节点集群（脚本）
-
-```bash
-scripts/cp-cluster.sh up      # CP 集群：启动 3 server + 3 client，并跟随日志
-scripts/ap-cluster.sh up      # AP 集群：同上
-```
-
-| 子命令 | 说明 |
-|---|---|
-| `up` | 启动并实时跟随全部日志（Ctrl+C 只退出跟随） |
-| `start` / `servers` / `clients` | 启动全部 / 仅 server / 仅 client（已在运行的跳过） |
-| `stop` | 停止全部 |
-| `status` | 查看进程与集群状态（CP 显示 leader） |
-| `logs [node-1\|client-2]` | 跟随单个或全部日志 |
-| `clean` | 停止并清空本地数据与日志 |
-
-节点布局（loopback）：
-
-| 节点 | HTTP | Remoting | 数据目录 |
-|---|---|---|---|
-| node-1 | 8848 | 9848 | `data/cp/node-1`（AP 为 `data/ap`） |
-| node-2 | 8849 | 9849 | `data/cp/node-2` |
-| node-3 | 8850 | 9850 | `data/cp/node-3` |
-
-CP 脚本使用 300/50ms 的测试选举超时（与三节点测试矩阵一致），杀 leader 后亚秒级换代；去掉脚本中的 `--raft-election-timeout-ms/--raft-heartbeat-ms` 即回到默认 1000/100。
-
-## 集群模式对比
-
-| | standalone | CP（Raft） | AP（Distro） |
-|---|---|---|---|
-| 一致性 | 单机即真相 | 强一致：多数派提交 | 最终一致：异步复制 + 周期校验收敛 |
-| 写 | 本地 | 任意节点收写 → 转发 leader，多数派落盘后提交 | 任意节点收写 → 转发分区 owner，owner 落盘即应答 |
-| 读 | 本地 | 默认 LOCAL；`LINEARIZABLE` 走 read-index | 默认 LOCAL；`LINEARIZABLE` 转发 owner |
-| leader/owner 故障 | — | 自动选主（约 1~2 个选举超时），已提交数据不丢 | 该分区写不可用，恢复后自愈（转移归 CP 路线） |
-| 复制 | — | Raft 日志复制（nextIndex 回退 / 快照追平） | 全量副本 + 分片写责任，异步推送全量 |
-| 成员 | — | 静态配置，变更需滚动重启 | 静态配置，变更需滚动重启 |
 
 ## Java SDK
 
@@ -119,8 +94,6 @@ CP 脚本使用 300/50ms 的测试选举超时（与三节点测试矩阵一致�
     <version>0.0.1-SNAPSHOT</version>
 </dependency>
 ```
-
-示例：
 
 ```java
 import com.ispengya.polyconfig.client.ClientOptions;
@@ -141,7 +114,7 @@ try (PolyConfigClient client = new PolyConfigClient(options)) {
     // 默认 LOCAL 读：优先本地缓存/快照，首次未命中走服务端
     String yaml = client.getConfig("DEFAULT_GROUP", "order-service.yml", 3000L);
 
-    // LINEARIZABLE 读：绕过缓存直连服务端强一致读（CP 走 read-index，AP 转发 owner），
+    // LINEARIZABLE：直连服务端强一致读（CP 走 read-index，AP 转发 owner），
     // 失败抛 UNAVAILABLE，绝不回退旧值
     String fresh = client.getConfig("DEFAULT_GROUP", "order-service.yml", 3000L,
             ReadConsistency.LINEARIZABLE);
@@ -154,28 +127,57 @@ try (PolyConfigClient client = new PolyConfigClient(options)) {
 
 行为约定：
 
-- **本地快照兜底**：服务端不可用时读本地快照启动；恢复后批量对账自动收敛
-- **故障转移**：多地址轮转，请求失败自动换节点重试；全部不可达时按连续失败次数指数退避
+- **本地快照兜底**：服务端不可用时读本地快照启动，恢复后批量对账自动收敛
+- **故障转移**：多地址轮转，请求失败自动换节点；全部不可达时按连续失败次数指数退避
 - **推送语义**：服务端 apply 即推送（每节点本地订阅表，不跨节点）；重复/乱序由 revision 守卫吸收
 - **取消订阅**：移除最后一个监听器后自动 `UNSUBSCRIBE`
+
+## 架构与实现要点
+
+```
+业务应用 ──SDK（Netty 长连接 / 变更推送）──┐
+浏览器   ──HTTP OpenAPI（同源控制台）─────┤
+                                          ▼
+                          poly-config server 集群
+                          ┌────────────────────────────────┐
+                          │ HTTP API + 控制台静态资源        │
+                          │ ConfigProtocol                  │
+                          │  ├─ LocalProtocol   (standalone)│
+                          │  ├─ RaftProtocol    (cp)        │
+                          │  └─ DistroProtocol  (ap)        │
+                          │ ConfigService + 通知/订阅引擎    │
+                          │ 状态机（内存）+ 统一分段日志 + 快照│
+                          └────────────────────────────────┘
+```
+
+| 模块 | 职责 |
+|---|---|
+| `poly-config-common` | 数据模型、协议 DTO、协议码、错误码、读一致性枚举 |
+| `poly-config-client` | Java SDK：连接、缓存、监听、本地快照、对账、故障转移 |
+| `poly-config-server` | `storage`（分段日志/快照）、`consistency`（协议 SPI）、`core`（状态机/Raft/Distro）、`server`（装配/HTTP/Netty/控制台） |
+
+几个关键机制：
+
+- **日志是真相源**：写入先追加分段日志并落盘，状态机由日志回放重建；快照负责压缩与快速恢复，恢复截断点低于已持久化 commitIndex 时拒绝启动
+- **提交后 apply 即推送**：订阅表每节点本地维护，apply 与推送在同一节点闭环；客户端按 per-key revision 单调守卫，乱序推送被吸收
+- **CP 的安全边界**：Raft 状态（term/role/votedFor/commitIndex/日志指针）全部串行化到单线程信箱，Netty 线程只收发字节；先 fsync 再投票、再应答
+- **AP 的收敛边界**：owner 单点分配版本；复制失败不重试，落后副本由周期校验（反熵）补齐，校验周期即收敛上界
 
 ## HTTP API
 
 | Method | Path | 说明 |
 |---|---|---|
 | GET | `/v1/cs/health` | 健康检查 |
-| GET | `/v1/cs/cluster` | 集群状态（节点角色、任期、leader、复制位点；`mode` 标识 CP/AP） |
+| GET | `/v1/cs/cluster` | 集群状态（角色、任期、leader、复制位点；`mode` 标识 CP/AP） |
 | GET/POST | `/v1/cs/namespaces` | 列出 / 创建 namespace |
 | GET/POST | `/v1/cs/groups` | 列出 / 创建 group |
 | GET | `/v1/cs/configs?namespace=&group=&dataId=[&consistency=LINEARIZABLE]` | 读配置 |
-| POST | `/v1/cs/configs` | 发布配置（body: `namespace`、`group`、`dataId`、`content`、`type`、`operator`、可选 `expectedVersion`） |
+| POST | `/v1/cs/configs` | 发布配置（`namespace`、`group`、`dataId`、`content`、`type`、`operator`、可选 `expectedVersion`） |
 | DELETE | `/v1/cs/configs?namespace=&group=&dataId=&operator=` | 删除配置 |
 | GET | `/v1/cs/configs/list?namespace=&group=&page=&size=&keyword=` | 分页列出（size ≤ 200） |
 | GET | `/v1/cs/history?namespace=&group=&dataId=&page=&size=` | 分页历史（size ≤ 100） |
 | POST | `/v1/cs/history/rollback` | 回滚到历史版本 |
 | GET | `/v1/cs/subscriptions` | 当前订阅视图 |
-
-示例：
 
 ```bash
 curl -X POST http://127.0.0.1:8848/v1/cs/configs \
@@ -231,8 +233,8 @@ poly-config
 mvn test
 ```
 
-- 集成测试使用 loopback 端口与临时数据目录，覆盖单机链路、订阅推送、快照恢复、AP/CP 三节点矩阵（含杀 leader 换代、滚动重启、线性读）。
-- `CpClusterMatrixTest` 覆盖 CP 完整矩阵；`ApClusterIntegrationTest` 覆盖 AP 复制与校验收敛。
+- 集成测试使用 loopback 端口与临时数据目录，覆盖单机链路、订阅推送、快照恢复、AP/CP 三节点矩阵（含杀 leader 换代、滚动重启、线性读）
+- `CpClusterMatrixTest` 覆盖 CP 完整矩阵；`ApClusterIntegrationTest` 覆盖 AP 复制与校验收敛
 
 ## 设计文档
 
@@ -242,12 +244,12 @@ mvn test
 | [docs/ap-design.md](docs/ap-design.md) | AP（Distro）设计、一致性与校验收敛 |
 | [docs/cp-design.md](docs/cp-design.md) | CP（Raft）设计：选举、复制、提交、线性读、快照 |
 | [docs/console-design.md](docs/console-design.md) | 控制台交互与视图 |
-| [docs/known-issues.md](docs/known-issues.md) | 已知问题清单与修复状态（含遗留项与优先级） |
+| [docs/known-issues.md](docs/known-issues.md) | 已知问题清单与修复状态 |
 
 ## 已知边界（v1 不做）
 
-- **无鉴权 / TLS / 限流**：管理面与长连接均无认证，默认只监听回环；对外部署需自行配置防火墙（见 ISSUE-19）
+- **无鉴权 / TLS / 限流**：管理面与长连接均无认证，默认只监听回环；对外部署需自行配置防火墙（ISSUE-19）
 - **配置与客户端快照明文落盘**：敏感配置需自行加密（ISSUE-20）
 - **静态集群成员**：变更需修改配置并滚动重启；动态成员（Raft 成员变更、owner 重平衡）属后续里程碑
-- **AP 不做 owner 故障转移**：owner 宕机期间该分区写不可用，恢复后自愈；故障转移问题由 CP 路线解决
+- **AP 不做 owner 故障转移**：owner 宕机期间该分区写不可用，恢复后自愈；转移问题由 CP 路线解决
 - v1 范围外：服务发现、多语言 SDK、RBAC/多租户/审计、灰度发布、配置加密、K8s Operator、Spring Cloud 集成

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">poly-config：一套代码支持 standalone、CP（Raft）、AP（Distro）三种一致性的配置中心</title>
+  <desc id="hero-desc">左侧为项目名与定位：部署时切换一致性，Java 8+、Maven 多模块、Netty 长连接、内嵌日志与快照。右侧为三节点 CP 集群示意：node-1 为 leader，node-2 与 node-3 为 follower，展示日志复制、term 与 commitIndex。</desc>
+
+  <defs>
+    <marker id="hero-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58A6FF"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="360" rx="24" fill="#0B0F14"/>
+  <rect x="1" y="1" width="1198" height="358" rx="23" fill="none" stroke="#1F2630" stroke-width="1.5"/>
+
+  <!-- 左侧：名称与定位 -->
+  <g id="title-block">
+    <text x="64" y="88" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="17" letter-spacing="2.6" fill="#7D8590">CONSISTENCY-CONFIGURABLE CONFIG CENTER</text>
+    <text x="64" y="160" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="64" font-weight="700" letter-spacing="-1" fill="#E6EDF3">poly-config</text>
+    <text x="64" y="208" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="24" fill="#C9D1D9">同一个配置中心，部署时切换一致性</text>
+    <text x="64" y="246" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="22" fill="#58A6FF">standalone · CP (Raft) · AP (Distro)</text>
+
+    <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="17" fill="#C9D1D9">
+      <rect x="64" y="282" width="104" height="34" rx="8" fill="#11161D" stroke="#232A34"/>
+      <text x="80" y="305">Java 8+</text>
+      <rect x="180" y="282" width="152" height="34" rx="8" fill="#11161D" stroke="#232A34"/>
+      <text x="196" y="305">Maven 多模块</text>
+      <rect x="344" y="282" width="144" height="34" rx="8" fill="#11161D" stroke="#232A34"/>
+      <text x="360" y="305">Netty 长连接</text>
+      <rect x="500" y="282" width="164" height="34" rx="8" fill="#11161D" stroke="#232A34"/>
+      <text x="516" y="305">内嵌日志 + 快照</text>
+    </g>
+  </g>
+
+  <!-- 右侧：CP 集群示意 -->
+  <g id="cluster">
+    <rect x="692" y="48" width="444" height="264" rx="16" fill="#0D1218" stroke="#1F2630"/>
+    <text x="716" y="84" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="17" fill="#7D8590">CP 集群 · 3 节点</text>
+    <text x="1112" y="84" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="17" fill="#7D8590">term 22 · commit 13</text>
+
+    <path d="M914 170 V188 H794 V212" fill="none" stroke="#58A6FF" stroke-width="1.5" marker-end="url(#hero-arrow)"/>
+    <path d="M914 170 V188 H1034 V212" fill="none" stroke="#58A6FF" stroke-width="1.5" marker-end="url(#hero-arrow)"/>
+
+    <rect x="834" y="102" width="160" height="68" rx="10" fill="#101820" stroke="#3FB950" stroke-width="1.5"/>
+    <circle cx="974" cy="120" r="5" fill="#3FB950"/>
+    <text x="854" y="134" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="19" fill="#E6EDF3">node-1</text>
+    <text x="854" y="160" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#3FB950">LEADER</text>
+
+    <rect x="714" y="216" width="160" height="68" rx="10" fill="#101820" stroke="#232A34"/>
+    <text x="734" y="248" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="19" fill="#E6EDF3">node-2</text>
+    <text x="734" y="274" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#7D8590">FOLLOWER</text>
+
+    <rect x="954" y="216" width="160" height="68" rx="10" fill="#101820" stroke="#232A34"/>
+    <text x="974" y="248" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="19" fill="#E6EDF3">node-3</text>
+    <text x="974" y="274" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#7D8590">FOLLOWER</text>
+  </g>
+</svg>
